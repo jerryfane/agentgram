@@ -22,6 +22,7 @@ making an ad hoc Telegram API call.
 agentgram send "message text"
 agentgram chat-id
 agentgram doctor
+agentgram update
 agentgram update --check
 ```
 
@@ -56,3 +57,10 @@ plugin packages.
 
 Do not send automatic status updates merely because an agent task completed.
 Agentgram sends should be explicit and user-requested.
+
+## Update Workflow
+
+Use `$AGENTGRAM_CMD update --check` for a read-only status check. Use
+`$AGENTGRAM_CMD update` only when the user asks to update Agentgram. The update
+command refuses dirty git checkouts, runs `git pull --ff-only`, validates the
+local CLI/plugin files, and prints any Codex refresh instructions it can detect.
