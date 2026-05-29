@@ -26,6 +26,9 @@ export TELEGRAM_CHAT_ID="123456789"
 Do not put real tokens in tracked files. `.env` and `.env.*` are ignored for
 local use, but environment variables are the preferred setup.
 
+For local setup templates, copy [.env.example](.env.example). It contains
+variable names only.
+
 ## Usage
 
 Install from a git checkout, then put the CLI on your `PATH`:
@@ -85,7 +88,33 @@ When a user asks an agent to send a Telegram message, the agent should:
 3. Avoid direct Telegram API calls unless the user explicitly asks to bypass the
    Agentgram CLI.
 
+## Troubleshooting
+
+- Bot was not started: open Telegram, send any message to the bot, then run
+  `agentgram chat-id` again.
+- Bad token: run `agentgram doctor`; malformed tokens fail locally, and revoked
+  or wrong tokens fail the Telegram `getMe` check.
+- Missing chat id: set `TELEGRAM_CHAT_ID`, or pass `--chat-id <id>` for a
+  one-off send after the user provides the target chat.
+- Forbidden chat: add the bot to the target chat or start a private chat with
+  it, then retry after confirming the chat id.
+- Telegram API errors: Agentgram prints Telegram's error description without the
+  bot token. Re-run `agentgram doctor` before retrying.
+
+## Release Checks
+
+Before release, run:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 scripts/validate_manifest.py
+git diff --check
+```
+
+See [docs/release-checklist.md](docs/release-checklist.md) for the full
+checklist and fresh-clone smoke.
+
 ## Status
 
-Task 1 CLI core is implemented. Packaging, install ergonomics, and release
-polish are tracked in [GOAL.md](GOAL.md).
+Pre-release. CLI core, Codex skill packaging, update ergonomics, release docs,
+and CI checks are implemented.
