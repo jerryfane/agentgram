@@ -7,10 +7,15 @@ Use this checklist before tagging or announcing an Agentgram release.
 - Confirm the repository is clean with `git status --short`.
 - Run `python3 -m unittest discover -s tests -v`.
 - Run `python3 scripts/validate_manifest.py`.
+- Run `python3 -m build`.
+- Install the built wheel in a temporary virtual environment and run
+  `agentgram --help`.
 - Run `git diff --check`.
 - Run `bin/agentgram update --check` from the release checkout.
 - Verify `.env.example` contains variable names only.
 - Verify `.agents/plugins/marketplace.json` points at `./plugins/agentgram`.
+- Verify PyPI package metadata uses distribution name `agentgram-tg` and command
+  name `agentgram`.
 - Verify no Telegram tokens, chat ids, generated plugin packages, logs, caches,
   or local session files are staged.
 
@@ -21,6 +26,11 @@ git clone https://github.com/jerryfane/agentgram.git /tmp/agentgram-smoke
 cd /tmp/agentgram-smoke
 python3 -m unittest discover -s tests -v
 python3 scripts/validate_manifest.py
+python3 -m pip install --upgrade build
+python3 -m build
+python3 -m venv /tmp/agentgram-wheel-smoke
+/tmp/agentgram-wheel-smoke/bin/python -m pip install dist/*.whl
+/tmp/agentgram-wheel-smoke/bin/agentgram --help
 bin/agentgram --help
 bin/agentgram doctor
 ```
@@ -39,6 +49,16 @@ codex plugin add agentgram@agentgram
 ```
 
 Start a new Codex thread after installing so updated skills are loaded.
+
+## Discovery Smoke
+
+- Confirm GitHub topics include `codex-plugin`, `openai-codex`,
+  `telegram-bot`, `ai-agents`, `agent-tools`, `python`, `cli`, and
+  `notifications`.
+- Confirm the latest release notes mention both Codex install and
+  `pipx install agentgram-tg`.
+- Submit or refresh the community marketplace listing and awesome-list PR when
+  release metadata changes.
 
 ## Optional Live Telegram Smoke
 

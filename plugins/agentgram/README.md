@@ -1,12 +1,21 @@
 # Agentgram
 
-Agentgram is an agent-neutral Telegram messaging helper. It lets Codex and
-other local coding agents send explicit, user-requested Telegram messages
+[![CI](https://github.com/jerryfane/agentgram/actions/workflows/ci.yml/badge.svg)](https://github.com/jerryfane/agentgram/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jerryfane/agentgram)](https://github.com/jerryfane/agentgram/releases)
+[![PyPI](https://img.shields.io/pypi/v/agentgram-tg)](https://pypi.org/project/agentgram-tg/)
+[![License](https://img.shields.io/github/license/jerryfane/agentgram)](LICENSE)
+
+Agentgram is a Codex Telegram plugin and agent-neutral messaging helper. It lets
+Codex and other local AI agents send explicit, user-requested Telegram messages
 through a Telegram bot token and chat id.
 
 Agentgram is intentionally local-first. It does not run a hosted service, and it
 does not send automatic completion notifications unless a future task explicitly
 adds that behavior.
+
+Use Agentgram when you want a Telegram notification plugin for AI agents, a
+simple way to send Telegram messages from Codex, or a reusable local CLI for
+agent messaging via a bot token.
 
 ## Requirements
 
@@ -31,7 +40,13 @@ variable names only.
 
 ## Usage
 
-Install from a git checkout, then put the CLI on your `PATH`:
+Install the released CLI from PyPI:
+
+```sh
+pipx install agentgram-tg
+```
+
+Or install from a git checkout, then put the CLI on your `PATH`:
 
 ```sh
 git clone https://github.com/jerryfane/agentgram.git ~/.agentgram/agentgram
@@ -77,7 +92,8 @@ skills are loaded.
 
 The Codex plugin skill lives in `skills/agentgram/SKILL.md`, with the plugin
 manifest at `.codex-plugin/plugin.json`. The skill tells Codex to use the local
-`agentgram` CLI as the execution path.
+`agentgram` CLI as the execution path. This repository also contains a public
+Codex marketplace file so Agentgram can be installed as a Codex Telegram plugin.
 
 To install Agentgram from the public Codex marketplace file in this repository:
 
@@ -127,5 +143,6 @@ checklist and fresh-clone smoke.
 
 ## Status
 
-Pre-release. CLI core, Codex skill packaging, update ergonomics, release docs,
-and CI checks are implemented.
+Released. Agentgram `v0.1.x` includes the Telegram CLI, Codex skill packaging,
+public Codex marketplace metadata, update ergonomics, release docs, and CI
+checks.

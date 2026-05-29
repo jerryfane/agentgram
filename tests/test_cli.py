@@ -15,8 +15,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from agentgram import cli
-from agentgram.telegram import TelegramClient, TelegramError, redact_token
+from agentgram_tg import cli
+from agentgram_tg.telegram import TelegramClient, TelegramError, redact_token
 
 
 def has_writable_tempdir() -> bool:
@@ -150,7 +150,7 @@ class CliRunTests(unittest.TestCase):
 
     def test_send_uses_telegram_client(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("agentgram.cli.TelegramClient") as client_cls:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.send_message.return_value = {"message_id": 42}
             code = cli.run(
                 ["send", "--silent", "hello"],
@@ -181,7 +181,7 @@ class CliRunTests(unittest.TestCase):
 
     def test_chat_id_raw_prints_updates(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("agentgram.cli.TelegramClient") as client_cls:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_updates.return_value = [{"message": {"chat": {"id": 1}}}]
             code = cli.run(
                 ["chat-id", "--raw"],
@@ -195,7 +195,7 @@ class CliRunTests(unittest.TestCase):
 
     def test_doctor_requires_default_chat_id(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("agentgram.cli.TelegramClient") as client_cls:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_me.return_value = {"username": "agentgram_bot"}
             code = cli.run(
                 ["doctor", "--json"],
@@ -212,7 +212,7 @@ class CliRunTests(unittest.TestCase):
 
     def test_doctor_treats_whitespace_chat_id_as_missing(self) -> None:
         stdout = io.StringIO()
-        with mock.patch("agentgram.cli.TelegramClient") as client_cls:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_me.return_value = {"username": "agentgram_bot"}
             code = cli.run(
                 ["doctor", "--json"],
@@ -245,7 +245,7 @@ class CliRunTests(unittest.TestCase):
         self.assertNotIn("abc def", json.dumps(payload))
 
     def test_update_check_does_not_fetch(self) -> None:
-        with mock.patch("agentgram.cli.run_git") as run_git:
+        with mock.patch("agentgram_tg.cli.run_git") as run_git:
             run_git.side_effect = ["main", "origin/main", "0\t0"]
 
             status = cli.git_update_status(Path("/tmp/repo"))
@@ -255,7 +255,7 @@ class CliRunTests(unittest.TestCase):
         self.assertNotIn(("fetch", "--quiet"), commands)
 
     def test_update_prints_codex_refresh_when_plugin_is_installed(self) -> None:
-        with mock.patch("agentgram.cli.detected_codex_agentgram_entry", return_value="agentgram@personal"):
+        with mock.patch("agentgram_tg.cli.detected_codex_agentgram_entry", return_value="agentgram@personal"):
             steps = cli.update_next_steps(Path("/opt/agentgram"))
 
         self.assertIn("codex plugin add agentgram@personal", "\n".join(steps))
@@ -266,7 +266,7 @@ agentgram@personal    not installed           /root/plugins/agentgram
 gitmoot@gitmoot-local installed, enabled 0.1.0 /root/.gitmoot/plugins/gitmoot
 """
         proc = subprocess.CompletedProcess(["codex", "plugin", "list"], 0, stdout=output, stderr="")
-        with mock.patch("agentgram.cli.subprocess.run", return_value=proc):
+        with mock.patch("agentgram_tg.cli.subprocess.run", return_value=proc):
             detected = cli.detected_codex_agentgram_entry()
 
         self.assertIsNone(detected)
@@ -276,7 +276,7 @@ gitmoot@gitmoot-local installed, enabled 0.1.0 /root/.gitmoot/plugins/gitmoot
 agentgram@personal installed, enabled  0.1.0   /root/plugins/agentgram
 """
         proc = subprocess.CompletedProcess(["codex", "plugin", "list"], 0, stdout=output, stderr="")
-        with mock.patch("agentgram.cli.subprocess.run", return_value=proc):
+        with mock.patch("agentgram_tg.cli.subprocess.run", return_value=proc):
             detected = cli.detected_codex_agentgram_entry()
 
         self.assertEqual(detected, "agentgram@personal")
@@ -346,12 +346,15 @@ class GitUpdateWorkflowTests(unittest.TestCase):
             self.git(seed, "commit", "-m", "remote update")
             self.git(seed, "push")
             stdout = io.StringIO()
-            with mock.patch("agentgram.cli.detected_codex_agentgram_entry", return_value=None):
+            with mock.patch("agentgram_tg.cli.detected_codex_agentgram_entry", return_value=None):
                 code = cli.run(["update", "--repo", str(checkout)], stdout=stdout, stderr=io.StringIO(), environ={})
 
             self.assertEqual(code, 0)
             self.assertIn("validation ok", stdout.getvalue())
             self.assertEqual((checkout / "README.md").read_text(encoding="utf-8"), "updated\n")
+
+    def test_validate_checkout_accepts_current_repo_layout(self) -> None:
+        cli.validate_checkout(ROOT)
 
     def test_update_rejects_non_agentgram_checkout_before_pull(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,8 +417,8 @@ class GitUpdateWorkflowTests(unittest.TestCase):
         )
         (repo / "skills" / "agentgram").mkdir(parents=True)
         (repo / "skills" / "agentgram" / "SKILL.md").write_text("---\nname: agentgram\n---\n", encoding="utf-8")
-        (repo / "src" / "agentgram").mkdir(parents=True)
-        (repo / "src" / "agentgram" / "cli.py").write_text("# cli\n", encoding="utf-8")
+        (repo / "src" / "agentgram_tg").mkdir(parents=True)
+        (repo / "src" / "agentgram_tg" / "cli.py").write_text("# cli\n", encoding="utf-8")
         (repo / "README.md").write_text(readme, encoding="utf-8")
 
     def configure_user(self, repo: Path) -> None:
@@ -439,7 +442,7 @@ class TelegramClientTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"ok": true, "result": {"message_id": 7}}'
 
-        with mock.patch("agentgram.telegram.request.urlopen", return_value=response) as urlopen:
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
             result = TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").request("sendMessage", {"text": "hi"})
 
         self.assertEqual(result, {"message_id": 7})
@@ -452,7 +455,7 @@ class TelegramClientTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"ok": false, "description": "Bad Request: chat not found"}'
 
-        with mock.patch("agentgram.telegram.request.urlopen", return_value=response):
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
             with self.assertRaisesRegex(TelegramError, "chat not found"):
                 TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").request("sendMessage", {})
 
@@ -466,7 +469,7 @@ class TelegramClientTests(unittest.TestCase):
             fp=io.BytesIO(b'{"ok": false, "description": "token 123456:abcdefghijklmnopqrstuvwxyz invalid"}'),
         )
 
-        with mock.patch("agentgram.telegram.request.urlopen", side_effect=http_error):
+        with mock.patch("agentgram_tg.telegram.request.urlopen", side_effect=http_error):
             with self.assertRaises(TelegramError) as caught:
                 TelegramClient(token).request("sendMessage", {})
 
