@@ -20,6 +20,16 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Validate plugin manifest
         run: python3 scripts/validate_manifest.py
+      - name: Build Python package
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+      - name: Smoke installed wheel
+        run: |
+          python3 -m venv /tmp/agentgram-wheel-smoke
+          /tmp/agentgram-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/agentgram-wheel-smoke/bin/agentgram --help
+          /tmp/agentgram-wheel-smoke/bin/agentgram doctor || true
       - name: Check whitespace
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

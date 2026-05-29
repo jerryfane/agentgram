@@ -20,6 +20,7 @@ MAX_TEXT_LENGTH = 4096
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
 PLUGIN_NAME = "agentgram"
+PYTHON_PACKAGE = "agentgram_tg"
 
 
 class CliError(RuntimeError):
@@ -374,7 +375,7 @@ def validate_checkout(repo: Path) -> None:
         repo / "bin" / "agentgram",
         repo / ".codex-plugin" / "plugin.json",
         repo / "skills" / PLUGIN_NAME / "SKILL.md",
-        repo / "src" / PLUGIN_NAME / "cli.py",
+        repo / "src" / PYTHON_PACKAGE / "cli.py",
     ]
     missing = [str(path.relative_to(repo)) for path in required_files if not path.is_file()]
     if missing:
