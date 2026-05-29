@@ -10,6 +10,7 @@ Use this checklist before tagging or announcing an Agentgram release.
 - Run `git diff --check`.
 - Run `bin/agentgram update --check` from the release checkout.
 - Verify `.env.example` contains variable names only.
+- Verify `.agents/plugins/marketplace.json` points at `./plugins/agentgram`.
 - Verify no Telegram tokens, chat ids, generated plugin packages, logs, caches,
   or local session files are staged.
 
@@ -26,6 +27,18 @@ bin/agentgram doctor
 
 `doctor` may fail until `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set; it
 should fail clearly without printing secret values.
+
+## Codex Marketplace Smoke
+
+After merging the release, verify Codex can discover the marketplace:
+
+```sh
+codex plugin marketplace add jerryfane/agentgram --ref main
+codex plugin list
+codex plugin add agentgram@agentgram
+```
+
+Start a new Codex thread after installing so updated skills are loaded.
 
 ## Optional Live Telegram Smoke
 
