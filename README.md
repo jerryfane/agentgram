@@ -28,34 +28,47 @@ local use, but environment variables are the preferred setup.
 
 ## Usage
 
-Run the local CLI from a checkout:
+Install from a git checkout, then put the CLI on your `PATH`:
 
 ```sh
-bin/agentgram doctor
-bin/agentgram send "deploy finished"
-bin/agentgram send --silent --no-preview "quiet update"
-bin/agentgram send --parse-mode HTML "<b>deploy finished</b>"
+git clone https://github.com/jerryfane/agentgram.git ~/.agentgram/agentgram
+mkdir -p ~/.local/bin
+ln -sf ~/.agentgram/agentgram/bin/agentgram ~/.local/bin/agentgram
+```
+
+Run the local CLI:
+
+```sh
+agentgram doctor
+agentgram send "deploy finished"
+agentgram send --silent --no-preview "quiet update"
+agentgram send --parse-mode HTML "<b>deploy finished</b>"
 ```
 
 To discover a chat id, first send a message to the bot in Telegram, then run:
 
 ```sh
-bin/agentgram chat-id
+agentgram chat-id
 ```
 
 For raw Telegram `getUpdates` output:
 
 ```sh
-bin/agentgram chat-id --raw
+agentgram chat-id --raw
 ```
 
-To check whether the local git checkout is current using existing local refs:
+To check whether the local git checkout is current using existing local refs, or
+to update with a fast-forward-only pull:
 
 ```sh
-bin/agentgram update --check
+agentgram update --check
+agentgram update
 ```
 
-The full mutating update workflow is planned in [GOAL.md](GOAL.md).
+`agentgram update` refuses dirty worktrees, validates the checkout after pulling,
+and prints runtime-specific next steps when it can detect them. Codex plugin
+users should reinstall or refresh the plugin and start a new thread so updated
+skills are loaded.
 
 ## Codex Plugin
 

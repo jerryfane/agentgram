@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from urllib import error
@@ -15,6 +17,14 @@ if str(SRC) not in sys.path:
 
 from agentgram import cli
 from agentgram.telegram import TelegramClient, TelegramError, redact_token
+
+
+def has_writable_tempdir() -> bool:
+    try:
+        with tempfile.TemporaryDirectory():
+            return True
+    except OSError:
+        return False
 
 
 class CliPayloadTests(unittest.TestCase):
@@ -243,6 +253,185 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("up to date", status)
         commands = [call.args[1:] for call in run_git.call_args_list]
         self.assertNotIn(("fetch", "--quiet"), commands)
+
+    def test_update_prints_codex_refresh_when_plugin_is_installed(self) -> None:
+        with mock.patch("agentgram.cli.detected_codex_agentgram_entry", return_value="agentgram@personal"):
+            steps = cli.update_next_steps(Path("/opt/agentgram"))
+
+        self.assertIn("codex plugin add agentgram@personal", "\n".join(steps))
+
+    def test_codex_detection_ignores_not_installed_marketplace_entry(self) -> None:
+        output = """PLUGIN                STATUS         VERSION  PATH
+agentgram@personal    not installed           /root/plugins/agentgram
+gitmoot@gitmoot-local installed, enabled 0.1.0 /root/.gitmoot/plugins/gitmoot
+"""
+        proc = subprocess.CompletedProcess(["codex", "plugin", "list"], 0, stdout=output, stderr="")
+        with mock.patch("agentgram.cli.subprocess.run", return_value=proc):
+            detected = cli.detected_codex_agentgram_entry()
+
+        self.assertIsNone(detected)
+
+    def test_codex_detection_returns_installed_agentgram_entry(self) -> None:
+        output = """PLUGIN             STATUS              VERSION PATH
+agentgram@personal installed, enabled  0.1.0   /root/plugins/agentgram
+"""
+        proc = subprocess.CompletedProcess(["codex", "plugin", "list"], 0, stdout=output, stderr="")
+        with mock.patch("agentgram.cli.subprocess.run", return_value=proc):
+            detected = cli.detected_codex_agentgram_entry()
+
+        self.assertEqual(detected, "agentgram@personal")
+
+    def test_origin_url_redacts_userinfo(self) -> None:
+        self.assertEqual(
+            cli.redact_url_userinfo("https://user:token@github.com/org/repo.git"),
+            "https://github.com/org/repo.git",
+        )
+
+
+@unittest.skipUnless(has_writable_tempdir(), "requires a writable temporary directory")
+class GitUpdateWorkflowTests(unittest.TestCase):
+    def test_update_check_reports_no_remote_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self.git(repo, "init")
+
+            status = cli.git_update_status(repo)
+
+        self.assertIn("unknown update state", status)
+        self.assertIn("no upstream configured", status)
+
+    def test_update_check_reports_current_ahead_and_behind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, seed = self.create_origin(Path(tmp))
+            checkout = Path(tmp) / "checkout"
+            self.git(Path(tmp), "clone", str(origin), str(checkout))
+            self.configure_user(checkout)
+
+            self.assertIn("up to date", cli.git_update_status(checkout))
+
+            (checkout / "local.txt").write_text("local\n", encoding="utf-8")
+            self.git(checkout, "add", "local.txt")
+            self.git(checkout, "commit", "-m", "local change")
+            self.assertIn("ahead 1, behind 0", cli.git_update_status(checkout))
+
+            self.git(checkout, "reset", "--hard", "origin/main")
+            (seed / "remote.txt").write_text("remote\n", encoding="utf-8")
+            self.git(seed, "add", "remote.txt")
+            self.git(seed, "commit", "-m", "remote change")
+            self.git(seed, "push")
+            self.git(checkout, "fetch")
+            self.assertIn("ahead 0, behind 1", cli.git_update_status(checkout))
+
+    def test_update_refuses_dirty_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, _seed = self.create_origin(Path(tmp))
+            checkout = Path(tmp) / "checkout"
+            self.git(Path(tmp), "clone", str(origin), str(checkout))
+            (checkout / "README.md").write_text("dirty\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            code = cli.run(["update", "--repo", str(checkout)], stdout=io.StringIO(), stderr=stderr, environ={})
+
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to update", stderr.getvalue())
+
+    def test_update_runs_fast_forward_pull_and_validates_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, seed = self.create_origin(Path(tmp))
+            checkout = Path(tmp) / "checkout"
+            self.git(Path(tmp), "clone", str(origin), str(checkout))
+            (seed / "README.md").write_text("updated\n", encoding="utf-8")
+            self.git(seed, "add", "README.md")
+            self.git(seed, "commit", "-m", "remote update")
+            self.git(seed, "push")
+            stdout = io.StringIO()
+            with mock.patch("agentgram.cli.detected_codex_agentgram_entry", return_value=None):
+                code = cli.run(["update", "--repo", str(checkout)], stdout=stdout, stderr=io.StringIO(), environ={})
+
+            self.assertEqual(code, 0)
+            self.assertIn("validation ok", stdout.getvalue())
+            self.assertEqual((checkout / "README.md").read_text(encoding="utf-8"), "updated\n")
+
+    def test_update_rejects_non_agentgram_checkout_before_pull(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, seed = self.create_plain_origin(Path(tmp))
+            checkout = Path(tmp) / "checkout"
+            self.git(Path(tmp), "clone", str(origin), str(checkout))
+            (seed / "README.md").write_text("remote update\n", encoding="utf-8")
+            self.git(seed, "add", "README.md")
+            self.git(seed, "commit", "-m", "remote update")
+            self.git(seed, "push")
+            stderr = io.StringIO()
+
+            code = cli.run(["update", "--repo", str(checkout)], stdout=io.StringIO(), stderr=stderr, environ={})
+
+            self.assertEqual(code, 2)
+            self.assertIn("checkout validation failed", stderr.getvalue())
+            self.assertEqual((checkout / "README.md").read_text(encoding="utf-8"), "plain\n")
+
+    def create_origin(self, root: Path) -> tuple[Path, Path]:
+        origin = root / "origin.git"
+        seed = root / "seed"
+        self.git(root, "init", "--bare", str(origin))
+        seed.mkdir()
+        self.git(seed, "init")
+        self.git(seed, "checkout", "-b", "main")
+        self.configure_user(seed)
+        self.write_agentgram_layout(seed, readme="initial\n")
+        self.git(seed, "add", ".")
+        self.git(seed, "commit", "-m", "initial")
+        self.git(seed, "remote", "add", "origin", str(origin))
+        self.git(seed, "push", "-u", "origin", "main")
+        self.git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+        return origin, seed
+
+    def create_plain_origin(self, root: Path) -> tuple[Path, Path]:
+        origin = root / "plain-origin.git"
+        seed = root / "plain-seed"
+        self.git(root, "init", "--bare", str(origin))
+        seed.mkdir()
+        self.git(seed, "init")
+        self.git(seed, "checkout", "-b", "main")
+        self.configure_user(seed)
+        (seed / "README.md").write_text("plain\n", encoding="utf-8")
+        self.git(seed, "add", ".")
+        self.git(seed, "commit", "-m", "initial")
+        self.git(seed, "remote", "add", "origin", str(origin))
+        self.git(seed, "push", "-u", "origin", "main")
+        self.git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+        return origin, seed
+
+    def write_agentgram_layout(self, repo: Path, *, readme: str) -> None:
+        (repo / "bin").mkdir(parents=True)
+        executable = repo / "bin" / "agentgram"
+        executable.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        executable.chmod(0o755)
+        (repo / ".codex-plugin").mkdir()
+        (repo / ".codex-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "agentgram", "skills": "./skills/"}),
+            encoding="utf-8",
+        )
+        (repo / "skills" / "agentgram").mkdir(parents=True)
+        (repo / "skills" / "agentgram" / "SKILL.md").write_text("---\nname: agentgram\n---\n", encoding="utf-8")
+        (repo / "src" / "agentgram").mkdir(parents=True)
+        (repo / "src" / "agentgram" / "cli.py").write_text("# cli\n", encoding="utf-8")
+        (repo / "README.md").write_text(readme, encoding="utf-8")
+
+    def configure_user(self, repo: Path) -> None:
+        self.git(repo, "config", "user.email", "agentgram@example.invalid")
+        self.git(repo, "config", "user.name", "Agentgram Tests")
+
+    def git(self, repo: Path, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return proc.stdout.strip()
 
 
 class TelegramClientTests(unittest.TestCase):
