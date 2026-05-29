@@ -1,7 +1,7 @@
 {
   "name": "agentgram",
   "version": "0.1.0",
-  "description": "Agent-neutral Telegram messaging plugin for sending messages through a bot token.",
+  "description": "Agent-neutral Telegram messaging helper for local coding agents.",
   "author": {
     "name": "Jerry Fane",
     "url": "https://github.com/jerryfane"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "Agentgram",
     "shortDescription": "Send Telegram messages from agent sessions.",
-    "longDescription": "Agentgram helps coding agents send explicit, user-requested Telegram messages through the Telegram Bot API using a local bot token and chat id.",
+    "longDescription": "Agentgram helps coding agents send explicit, user-requested Telegram messages through the local Agentgram CLI and Telegram Bot API using a bot token and chat id from the user's environment.",
     "developerName": "Jerry Fane",
     "category": "Productivity",
     "capabilities": [
