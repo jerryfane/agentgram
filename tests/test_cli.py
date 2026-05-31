@@ -815,6 +815,22 @@ class TelegramClientTests(unittest.TestCase):
         self.assertEqual(req.headers["Content-type"], "application/json")
         self.assertEqual(json.loads(req.data.decode("utf-8")), {"text": "hi"})
 
+    def test_request_rejects_non_object_json_response(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'["not", "an", "object"]'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(TelegramError, "unexpected JSON response"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").request("sendMessage", {})
+
+    def test_get_me_rejects_unexpected_result(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": []}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(TelegramError, "getMe returned an unexpected result"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_me()
+
     def test_encode_multipart_form_includes_fields_and_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.txt"
@@ -935,6 +951,19 @@ class TelegramClientTests(unittest.TestCase):
 
         self.assertNotIn(token, str(caught.exception))
         self.assertIn("<redacted>", str(caught.exception))
+
+    def test_http_error_handles_non_object_json(self) -> None:
+        http_error = error.HTTPError(
+            "https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz/sendMessage",
+            502,
+            "Bad Gateway",
+            hdrs=None,
+            fp=io.BytesIO(b'["bad", "gateway"]'),
+        )
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", side_effect=http_error):
+            with self.assertRaisesRegex(TelegramError, r'\["bad", "gateway"\]'):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").request("sendMessage", {})
 
     def test_redact_token(self) -> None:
         self.assertEqual(redact_token("abc token abc", "token"), "abc <redacted> abc")
