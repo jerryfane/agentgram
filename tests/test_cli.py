@@ -228,7 +228,7 @@ class CliPayloadTests(unittest.TestCase):
 class CliRunTests(unittest.TestCase):
     def test_help_lists_public_commands(self) -> None:
         output = cli.build_parser().format_help()
-        for command in ("send", "chat-id", "doctor", "update"):
+        for command in ("send", "send-file", "chat-id", "doctor", "update"):
             self.assertIn(command, output)
 
     def test_send_requires_token_without_leaking(self) -> None:
@@ -263,6 +263,116 @@ class CliRunTests(unittest.TestCase):
             stderr=stderr,
             environ={"TELEGRAM_BOT_TOKEN": "abc def", "TELEGRAM_CHAT_ID": "99"},
         )
+
+        self.assertEqual(code, 1)
+        self.assertIn("token shape is invalid", stderr.getvalue())
+        self.assertNotIn("abc def", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_send_file_uses_telegram_client(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text("# report\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.send_document.return_value = {"message_id": 43}
+                code = cli.run(
+                    [
+                        "send-file",
+                        "--caption",
+                        "Report",
+                        "--parse-mode",
+                        "HTML",
+                        "--silent",
+                        str(path),
+                    ],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        client_cls.return_value.send_document.assert_called_once_with(
+            {
+                "chat_id": "99",
+                "caption": "Report",
+                "parse_mode": "HTML",
+                "disable_notification": True,
+            },
+            path,
+        )
+        self.assertEqual(stdout.getvalue().strip(), "sent document message_id=43")
+
+    def test_send_file_uses_chat_id_override(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text("# report\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.send_document.return_value = {}
+                code = cli.run(
+                    ["send-file", "--chat-id", "123", str(path)],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+                )
+
+        self.assertEqual(code, 0)
+        client_cls.return_value.send_document.assert_called_once_with({"chat_id": "123"}, path)
+        self.assertEqual(stdout.getvalue().strip(), "sent document")
+
+    def test_send_file_requires_token_without_leaking(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(["send-file", "/tmp/report.md"], stdout=io.StringIO(), stderr=stderr, environ={})
+
+        self.assertEqual(code, 2)
+        self.assertIn("TELEGRAM_BOT_TOKEN is required", stderr.getvalue())
+
+    def test_send_file_requires_chat_id(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text("# report\n", encoding="utf-8")
+            code = cli.run(
+                ["send-file", str(path)],
+                stdout=io.StringIO(),
+                stderr=stderr,
+                environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("TELEGRAM_CHAT_ID is required", stderr.getvalue())
+
+    def test_send_file_rejects_invalid_path_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(
+            ["send-file", "/tmp/agentgram-missing-report.md"],
+            stdout=io.StringIO(),
+            stderr=stderr,
+            environ={
+                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                "TELEGRAM_CHAT_ID": "99",
+            },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("file does not exist", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_send_file_rejects_malformed_token_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text("# report\n", encoding="utf-8")
+            code = cli.run(
+                ["send-file", str(path)],
+                stdout=io.StringIO(),
+                stderr=stderr,
+                environ={"TELEGRAM_BOT_TOKEN": "abc def", "TELEGRAM_CHAT_ID": "99"},
+            )
 
         self.assertEqual(code, 1)
         self.assertIn("token shape is invalid", stderr.getvalue())
