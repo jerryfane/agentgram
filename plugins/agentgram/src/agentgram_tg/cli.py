@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("text", nargs="+", help="message text")
     send.set_defaults(func=cmd_send)
 
+    send_file = subcommands.add_parser("send-file", help="send a Telegram document")
+    send_file.add_argument("--chat-id", help=f"override {CHAT_ID_ENV}")
+    send_file.add_argument("--caption", help="optional document caption")
+    send_file.add_argument("--parse-mode", choices=("HTML", "MarkdownV2"), help="Telegram caption parse mode")
+    send_file.add_argument("--silent", action="store_true", help="send without notification sound")
+    send_file.add_argument("path", help="path to the local file to send")
+    send_file.set_defaults(func=cmd_send_file)
+
     chat_id = subcommands.add_parser("chat-id", help="show candidate chat ids from recent updates")
     chat_id.add_argument("--raw", action="store_true", help="print raw getUpdates JSON")
     chat_id.set_defaults(func=cmd_chat_id)
@@ -106,6 +114,25 @@ def cmd_send(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str
         print("sent", file=stdout)
     else:
         print(f"sent message_id={message_id}", file=stdout)
+    return 0
+
+
+def cmd_send_file(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str]) -> int:
+    token = require_env(environ, TOKEN_ENV)
+    chat_id = args.chat_id or require_env(environ, CHAT_ID_ENV)
+    document_path = validate_document_path(args.path)
+    payload = build_document_payload(
+        chat_id=chat_id,
+        caption=args.caption,
+        parse_mode=args.parse_mode,
+        silent=args.silent,
+    )
+    message = TelegramClient(token).send_document(payload, document_path)
+    message_id = message.get("message_id")
+    if message_id is None:
+        print("sent document", file=stdout)
+    else:
+        print(f"sent document message_id={message_id}", file=stdout)
     return 0
 
 
