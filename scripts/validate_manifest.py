@@ -10,7 +10,7 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_VERSION = "0.1.1"
+EXPECTED_VERSION = "0.2.0"
 
 
 def main() -> int:
