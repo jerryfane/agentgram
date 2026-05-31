@@ -10,6 +10,9 @@ Use this checklist before tagging or announcing an Agentgram release.
 - Run `python3 -m build`.
 - Install the built wheel in a temporary virtual environment and run
   `agentgram --help`.
+- Run `bin/agentgram send --help` and verify it lists `--split`, `--as-file`,
+  and `--filename`.
+- Run `bin/agentgram send-file --help`.
 - Run `git diff --check`.
 - Run `bin/agentgram update --check` from the release checkout.
 - Verify `.env.example` contains variable names only.
@@ -31,7 +34,11 @@ python3 -m build
 python3 -m venv /tmp/agentgram-wheel-smoke
 /tmp/agentgram-wheel-smoke/bin/python -m pip install dist/*.whl
 /tmp/agentgram-wheel-smoke/bin/agentgram --help
+/tmp/agentgram-wheel-smoke/bin/agentgram send --help
+/tmp/agentgram-wheel-smoke/bin/agentgram send-file --help
 bin/agentgram --help
+bin/agentgram send --help
+bin/agentgram send-file --help
 bin/agentgram doctor
 ```
 
@@ -69,4 +76,16 @@ export TELEGRAM_BOT_TOKEN="..."
 export TELEGRAM_CHAT_ID="..."
 bin/agentgram doctor
 bin/agentgram send "Agentgram release smoke"
+tmp_file="$(mktemp /tmp/agentgram-smoke.XXXXXX.txt)"
+printf 'Agentgram file smoke\n' > "$tmp_file"
+bin/agentgram send-file "$tmp_file" --caption "Agentgram file smoke"
+bin/agentgram send --split "$(python3 - <<'PY'
+print('Agentgram split smoke ' * 260)
+PY
+)"
+bin/agentgram send --as-file --filename agentgram-smoke.txt "$(python3 - <<'PY'
+print('Agentgram as-file smoke ' * 260)
+PY
+)"
+rm -f "$tmp_file"
 ```
