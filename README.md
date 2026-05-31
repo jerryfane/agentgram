@@ -174,6 +174,6 @@ checklist and fresh-clone smoke.
 
 ## Status
 
-Released. Agentgram `v0.1.x` includes the Telegram CLI, Codex skill packaging,
-public Codex marketplace metadata, update ergonomics, release docs, and CI
-checks.
+Released. Agentgram `v0.2.x` includes the Telegram CLI, file sending, long-text
+delivery modes, Codex skill packaging, public Codex marketplace metadata, update
+ergonomics, release docs, and CI checks.
