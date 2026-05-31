@@ -13,10 +13,17 @@ from typing import Any, Iterable, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
-from .telegram import TelegramClient, TelegramError, looks_like_token
+from .telegram import (
+    MAX_DOCUMENT_BYTES,
+    TelegramClient,
+    TelegramError,
+    looks_like_token,
+    validate_document_path as validate_telegram_document_path,
+)
 
 
 MAX_TEXT_LENGTH = 4096
+MAX_CAPTION_LENGTH = 1024
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
 PLUGIN_NAME = "agentgram"
@@ -225,6 +232,26 @@ def build_send_payload(
     return payload
 
 
+def build_document_payload(
+    *,
+    chat_id: str,
+    caption: str | None,
+    parse_mode: str | None,
+    silent: bool,
+) -> dict[str, Any]:
+    if not str(chat_id).strip():
+        raise CliError("chat id is required")
+    validate_caption(caption, parse_mode=parse_mode)
+    payload: dict[str, Any] = {"chat_id": chat_id}
+    if caption:
+        payload["caption"] = caption
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if silent:
+        payload["disable_notification"] = True
+    return payload
+
+
 def normalize_text(parts: Iterable[str]) -> str:
     text = " ".join(parts).strip()
     validate_text(text, parse_mode=None, enforce_max=False)
@@ -237,6 +264,21 @@ def validate_text(text: str, *, parse_mode: str | None = None, enforce_max: bool
     length = telegram_text_length(text, parse_mode)
     if enforce_max and length > MAX_TEXT_LENGTH:
         raise CliError(f"message text is too long: {length} characters; maximum is {MAX_TEXT_LENGTH}")
+
+
+def validate_caption(caption: str | None, *, parse_mode: str | None = None) -> None:
+    if caption is None or caption == "":
+        return
+    length = telegram_text_length(caption, parse_mode)
+    if length > MAX_CAPTION_LENGTH:
+        raise CliError(f"caption is too long: {length} characters; maximum is {MAX_CAPTION_LENGTH}")
+
+
+def validate_document_path(path: str | Path) -> Path:
+    try:
+        return validate_telegram_document_path(path)
+    except TelegramError as exc:
+        raise CliError(str(exc)) from exc
 
 
 def telegram_text_length(text: str, parse_mode: str | None) -> int:

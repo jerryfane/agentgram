@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from agentgram_tg import cli
-from agentgram_tg.telegram import TelegramClient, TelegramError, redact_token
+from agentgram_tg.telegram import TelegramClient, TelegramError, encode_multipart_form, redact_token
 
 
 def has_writable_tempdir() -> bool:
@@ -118,6 +118,96 @@ class CliPayloadTests(unittest.TestCase):
                 silent=False,
                 no_preview=False,
             )
+
+    def test_build_document_payload_uses_telegram_fields(self) -> None:
+        payload = cli.build_document_payload(
+            chat_id="12345",
+            caption="report",
+            parse_mode="HTML",
+            silent=True,
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "chat_id": "12345",
+                "caption": "report",
+                "parse_mode": "HTML",
+                "disable_notification": True,
+            },
+        )
+
+    def test_build_document_payload_allows_no_caption(self) -> None:
+        payload = cli.build_document_payload(
+            chat_id="12345",
+            caption=None,
+            parse_mode=None,
+            silent=False,
+        )
+
+        self.assertEqual(payload, {"chat_id": "12345"})
+
+    def test_document_payload_requires_chat_id(self) -> None:
+        with self.assertRaises(cli.CliError):
+            cli.build_document_payload(chat_id="", caption=None, parse_mode=None, silent=False)
+
+    def test_caption_length_uses_visible_html(self) -> None:
+        cli.validate_caption(f"<b>{'x' * cli.MAX_CAPTION_LENGTH}</b>", parse_mode="HTML")
+
+    def test_plain_caption_over_limit_is_rejected(self) -> None:
+        with self.assertRaises(cli.CliError):
+            cli.validate_caption("x" * (cli.MAX_CAPTION_LENGTH + 1), parse_mode=None)
+
+    def test_caption_visible_text_over_limit_is_rejected(self) -> None:
+        with self.assertRaises(cli.CliError):
+            cli.validate_caption(f"<b>{'x' * (cli.MAX_CAPTION_LENGTH + 1)}</b>", parse_mode="HTML")
+
+    def test_caption_markdown_link_destination_is_not_visible_text(self) -> None:
+        cli.validate_caption(
+            f"[{'x' * cli.MAX_CAPTION_LENGTH}](https://example.com/{'y' * 5000})",
+            parse_mode="MarkdownV2",
+        )
+
+    def test_document_path_validation_accepts_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.txt"
+            path.write_text("hello\n", encoding="utf-8")
+
+            self.assertEqual(cli.validate_document_path(path), path)
+
+    def test_document_path_validation_rejects_missing_file(self) -> None:
+        with self.assertRaisesRegex(cli.CliError, "file does not exist"):
+            cli.validate_document_path("/tmp/agentgram-missing-file")
+
+    def test_document_path_validation_rejects_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(cli.CliError, "not a regular file"):
+                cli.validate_document_path(tmp)
+
+    def test_document_path_validation_rejects_empty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.txt"
+            path.touch()
+
+            with self.assertRaisesRegex(cli.CliError, "file is empty"):
+                cli.validate_document_path(path)
+
+    def test_document_path_validation_rejects_oversized_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large.txt"
+            with path.open("wb") as handle:
+                handle.truncate(cli.MAX_DOCUMENT_BYTES + 1)
+
+            with self.assertRaisesRegex(cli.CliError, "file is too large"):
+                cli.validate_document_path(path)
+
+    def test_document_path_validation_rejects_unreadable_file_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret.txt"
+            path.write_text("secret\n", encoding="utf-8")
+            with mock.patch("pathlib.Path.open", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(cli.CliError, "not readable"):
+                    cli.validate_document_path(path)
 
     def test_extract_chat_candidates_deduplicates_chats(self) -> None:
         updates = [
@@ -450,6 +540,102 @@ class TelegramClientTests(unittest.TestCase):
         self.assertEqual(req.get_method(), "POST")
         self.assertEqual(req.headers["Content-type"], "application/json")
         self.assertEqual(json.loads(req.data.decode("utf-8")), {"text": "hi"})
+
+    def test_encode_multipart_form_includes_fields_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.txt"
+            path.write_text("hello\n", encoding="utf-8")
+
+            body, content_type = encode_multipart_form(
+                {"chat_id": "99", "caption": "Report", "disable_notification": True},
+                "document",
+                path,
+                boundary="agentgram-test-boundary",
+            )
+
+        decoded = body.decode("utf-8")
+        self.assertEqual(content_type, "multipart/form-data; boundary=agentgram-test-boundary")
+        self.assertIn('name="chat_id"', decoded)
+        self.assertIn("\r\n99\r\n", decoded)
+        self.assertIn('name="caption"', decoded)
+        self.assertIn("\r\nReport\r\n", decoded)
+        self.assertIn('name="disable_notification"', decoded)
+        self.assertIn("\r\ntrue\r\n", decoded)
+        self.assertIn('name="document"; filename="report.txt"', decoded)
+        self.assertIn("Content-Type: text/plain", decoded)
+        self.assertIn("\r\nhello\n\r\n", decoded)
+
+    def test_send_document_posts_multipart_and_returns_result(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": {"message_id": 8}}'
+        token = "123456:abcdefghijklmnopqrstuvwxyz"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.txt"
+            path.write_text("hello\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+                result = TelegramClient(token).send_document({"chat_id": "99", "caption": "Report"}, path)
+
+        self.assertEqual(result, {"message_id": 8})
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.full_url, f"https://api.telegram.org/bot{token}/sendDocument")
+        self.assertTrue(req.headers["Content-type"].startswith("multipart/form-data; boundary=agentgram-"))
+        self.assertIn(b'name="document"; filename="report.txt"', req.data)
+        self.assertIn(b"hello\n", req.data)
+        self.assertNotIn(token.encode("utf-8"), req.data)
+
+    def test_send_document_rejects_oversized_file_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large.txt"
+            with path.open("wb") as handle:
+                handle.truncate(cli.MAX_DOCUMENT_BYTES + 1)
+            with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(TelegramError, "file is too large"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").send_document({"chat_id": "99"}, path)
+
+        urlopen.assert_not_called()
+
+    def test_send_document_rejects_missing_file_before_upload(self) -> None:
+        with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(TelegramError, "file does not exist"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").send_document(
+                    {"chat_id": "99"},
+                    Path("/tmp/agentgram-missing-document"),
+                )
+
+        urlopen.assert_not_called()
+
+    def test_send_document_rejects_unexpected_result(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": []}'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.txt"
+            path.write_text("hello\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+                with self.assertRaisesRegex(TelegramError, "sendDocument returned an unexpected result"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").send_document({"chat_id": "99"}, path)
+
+    def test_send_document_http_error_redacts_token(self) -> None:
+        token = "123456:abcdefghijklmnopqrstuvwxyz"
+        http_error = error.HTTPError(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b'{"ok": false, "description": "token 123456:abcdefghijklmnopqrstuvwxyz invalid"}'),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.txt"
+            path.write_text("hello\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.telegram.request.urlopen", side_effect=http_error):
+                with self.assertRaises(TelegramError) as caught:
+                    TelegramClient(token).send_document({"chat_id": "99"}, path)
+
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIn("<redacted>", str(caught.exception))
 
     def test_telegram_error_response_uses_description(self) -> None:
         response = mock.MagicMock()
