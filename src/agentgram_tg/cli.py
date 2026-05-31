@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterable, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
@@ -71,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--parse-mode", choices=("HTML", "MarkdownV2"), help="Telegram parse mode")
     send.add_argument("--silent", action="store_true", help="send without notification sound")
     send.add_argument("--no-preview", action="store_true", help="disable link previews")
+    long_mode = send.add_mutually_exclusive_group()
+    long_mode.add_argument("--split", action="store_true", help="split long plain text into multiple messages")
+    long_mode.add_argument("--as-file", action="store_true", help="send the text as a UTF-8 document")
+    send.add_argument("--filename", help="document filename for --as-file")
     send.add_argument("text", nargs="+", help="message text")
     send.set_defaults(func=cmd_send)
 
@@ -101,6 +106,32 @@ def cmd_send(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str
     token = require_env(environ, TOKEN_ENV)
     chat_id = args.chat_id or require_env(environ, CHAT_ID_ENV)
     text = normalize_text(args.text)
+    if args.filename and not args.as_file:
+        raise CliError("--filename requires --as-file")
+    if args.as_file:
+        if args.parse_mode:
+            raise CliError("--as-file does not support --parse-mode; file contents are sent as plain UTF-8")
+        if args.no_preview:
+            raise CliError("--no-preview is only supported for text messages")
+        return send_text_as_file(
+            token=token,
+            chat_id=chat_id,
+            text=text,
+            filename=args.filename,
+            silent=args.silent,
+            stdout=stdout,
+        )
+    if args.split:
+        if args.parse_mode:
+            raise CliError("--split does not support --parse-mode yet")
+        return send_split_text(
+            token=token,
+            chat_id=chat_id,
+            text=text,
+            silent=args.silent,
+            no_preview=args.no_preview,
+            stdout=stdout,
+        )
     payload = build_send_payload(
         chat_id=chat_id,
         text=text,
@@ -114,6 +145,61 @@ def cmd_send(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str
         print("sent", file=stdout)
     else:
         print(f"sent message_id={message_id}", file=stdout)
+    return 0
+
+
+def send_split_text(
+    *,
+    token: str,
+    chat_id: str,
+    text: str,
+    silent: bool,
+    no_preview: bool,
+    stdout: TextIO,
+) -> int:
+    client = TelegramClient(token)
+    message_ids: list[str] = []
+    chunks = split_message_text(text)
+    for chunk in chunks:
+        payload = build_send_payload(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=None,
+            silent=silent,
+            no_preview=no_preview,
+        )
+        message = client.send_message(payload)
+        message_id = message.get("message_id")
+        if message_id is not None:
+            message_ids.append(str(message_id))
+    if message_ids:
+        print(f"sent messages count={len(chunks)} message_ids={','.join(message_ids)}", file=stdout)
+    else:
+        print(f"sent messages count={len(chunks)}", file=stdout)
+    return 0
+
+
+def send_text_as_file(
+    *,
+    token: str,
+    chat_id: str,
+    text: str,
+    filename: str | None,
+    silent: bool,
+    stdout: TextIO,
+) -> int:
+    document_name = validate_text_filename(filename)
+    client = TelegramClient(token)
+    with tempfile.TemporaryDirectory(prefix="agentgram-") as tmp:
+        document_path = Path(tmp) / document_name
+        document_path.write_text(text, encoding="utf-8")
+        payload = build_document_payload(chat_id=chat_id, caption=None, parse_mode=None, silent=silent)
+        message = client.send_document(payload, document_path)
+    message_id = message.get("message_id")
+    if message_id is None:
+        print("sent document", file=stdout)
+    else:
+        print(f"sent document message_id={message_id}", file=stdout)
     return 0
 
 
@@ -306,6 +392,53 @@ def validate_document_path(path: str | Path) -> Path:
         return validate_telegram_document_path(path)
     except TelegramError as exc:
         raise CliError(str(exc)) from exc
+
+
+def validate_text_filename(filename: str | None) -> str:
+    if filename is None:
+        return "agentgram-message.txt"
+    name = filename.strip()
+    if not name:
+        raise CliError("filename is required")
+    if "/" in name or "\\" in name or Path(name).name != name or name in (".", ".."):
+        raise CliError("filename must be a file name, not a path")
+    return name
+
+
+def split_message_text(text: str, *, limit: int = MAX_TEXT_LENGTH) -> list[str]:
+    validate_text(text, parse_mode=None, enforce_max=False)
+    expected_chunks = 1
+    while True:
+        prefix_length = len(f"[{expected_chunks}/{expected_chunks}] ")
+        chunk_limit = limit - prefix_length
+        if chunk_limit <= 0:
+            raise CliError("message limit is too small for split counters")
+        raw_chunks = split_plain_text(text, chunk_limit)
+        if len(raw_chunks) == expected_chunks:
+            return [f"[{index}/{expected_chunks}] {chunk}" for index, chunk in enumerate(raw_chunks, start=1)]
+        expected_chunks = len(raw_chunks)
+
+
+def split_plain_text(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = best_plain_text_split(remaining, limit)
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    return chunks
+
+
+def best_plain_text_split(text: str, limit: int) -> int:
+    window = text[:limit]
+    for boundary in ("\n\n", "\n", " "):
+        position = window.rfind(boundary)
+        if position > 0:
+            return position + len(boundary)
+    return limit
 
 
 def telegram_text_length(text: str, parse_mode: str | None) -> int:

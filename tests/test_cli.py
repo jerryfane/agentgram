@@ -56,6 +56,38 @@ class CliPayloadTests(unittest.TestCase):
         with self.assertRaises(cli.CliError):
             cli.validate_text("x" * (cli.MAX_TEXT_LENGTH + 1), parse_mode=None)
 
+    def test_split_message_text_keeps_chunks_under_limit(self) -> None:
+        text = "alpha beta gamma delta epsilon"
+
+        chunks = cli.split_message_text(text, limit=16)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunk.split("] ", 1)[1] for chunk in chunks), text)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 16)
+        self.assertTrue(chunks[0].startswith("[1/"))
+
+    def test_split_message_text_prefers_paragraph_boundaries(self) -> None:
+        text = "first paragraph\n\nsecond paragraph\nthird paragraph"
+
+        chunks = cli.split_message_text(text, limit=28)
+
+        self.assertIn("first paragraph\n\n", chunks[0])
+        self.assertEqual("".join(chunk.split("] ", 1)[1] for chunk in chunks), text)
+
+    def test_split_message_text_splits_mid_word_as_last_resort(self) -> None:
+        chunks = cli.split_message_text("abcdefghij", limit=10)
+
+        self.assertEqual(chunks, ["[1/3] abcd", "[2/3] efgh", "[3/3] ij"])
+
+    def test_validate_text_filename_rejects_paths(self) -> None:
+        self.assertEqual(cli.validate_text_filename(None), "agentgram-message.txt")
+        self.assertEqual(cli.validate_text_filename("report.md"), "report.md")
+        with self.assertRaisesRegex(cli.CliError, "not a path"):
+            cli.validate_text_filename("../report.md")
+        with self.assertRaisesRegex(cli.CliError, "not a path"):
+            cli.validate_text_filename("nested\\report.md")
+
     def test_html_length_uses_visible_text(self) -> None:
         payload = cli.build_send_payload(
             chat_id="12345",
@@ -238,6 +270,21 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("TELEGRAM_BOT_TOKEN is required", stderr.getvalue())
 
+    def test_send_rejects_long_text_by_default(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(
+            ["send", "x" * (cli.MAX_TEXT_LENGTH + 1)],
+            stdout=io.StringIO(),
+            stderr=stderr,
+            environ={
+                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                "TELEGRAM_CHAT_ID": "99",
+            },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("message text is too long", stderr.getvalue())
+
     def test_send_uses_telegram_client(self) -> None:
         stdout = io.StringIO()
         with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
@@ -254,6 +301,123 @@ class CliRunTests(unittest.TestCase):
             {"chat_id": "99", "text": "hello", "disable_notification": True}
         )
         self.assertEqual(stdout.getvalue().strip(), "sent message_id=42")
+
+    def test_send_split_uses_telegram_client_for_each_chunk(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.send_message.side_effect = [
+                {"message_id": 1},
+                {"message_id": 2},
+            ]
+            with mock.patch("agentgram_tg.cli.split_message_text", return_value=["[1/2] hello", "[2/2] world"]):
+                code = cli.run(
+                    ["send", "--split", "--silent", "--no-preview", "hello", "world"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(client_cls.return_value.send_message.call_count, 2)
+        client_cls.return_value.send_message.assert_has_calls(
+            [
+                mock.call(
+                    {
+                        "chat_id": "99",
+                        "text": "[1/2] hello",
+                        "disable_notification": True,
+                        "link_preview_options": {"is_disabled": True},
+                    }
+                ),
+                mock.call(
+                    {
+                        "chat_id": "99",
+                        "text": "[2/2] world",
+                        "disable_notification": True,
+                        "link_preview_options": {"is_disabled": True},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(stdout.getvalue().strip(), "sent messages count=2 message_ids=1,2")
+
+    def test_send_split_rejects_parse_mode(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(
+            ["send", "--split", "--parse-mode", "HTML", "<b>hello</b>"],
+            stdout=io.StringIO(),
+            stderr=stderr,
+            environ={
+                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                "TELEGRAM_CHAT_ID": "99",
+            },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--split does not support --parse-mode", stderr.getvalue())
+
+    def test_send_as_file_uses_temporary_document(self) -> None:
+        stdout = io.StringIO()
+        seen: dict[str, object] = {}
+
+        def send_document(payload: dict[str, object], path: Path) -> dict[str, object]:
+            seen["payload"] = payload
+            seen["name"] = path.name
+            seen["content"] = path.read_text(encoding="utf-8")
+            seen["exists_during_call"] = path.exists()
+            return {"message_id": 44}
+
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.send_document.side_effect = send_document
+            code = cli.run(
+                ["send", "--as-file", "--filename", "report.md", "--silent", "#", "report"],
+                stdout=stdout,
+                stderr=io.StringIO(),
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                    "TELEGRAM_CHAT_ID": "99",
+                },
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["payload"], {"chat_id": "99", "disable_notification": True})
+        self.assertEqual(seen["name"], "report.md")
+        self.assertEqual(seen["content"], "# report")
+        self.assertTrue(seen["exists_during_call"])
+        self.assertEqual(stdout.getvalue().strip(), "sent document message_id=44")
+
+    def test_send_as_file_rejects_filename_without_mode(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(
+            ["send", "--filename", "report.md", "hello"],
+            stdout=io.StringIO(),
+            stderr=stderr,
+            environ={
+                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                "TELEGRAM_CHAT_ID": "99",
+            },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--filename requires --as-file", stderr.getvalue())
+
+    def test_send_as_file_rejects_parse_mode(self) -> None:
+        stderr = io.StringIO()
+        code = cli.run(
+            ["send", "--as-file", "--parse-mode", "MarkdownV2", "hello"],
+            stdout=io.StringIO(),
+            stderr=stderr,
+            environ={
+                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                "TELEGRAM_CHAT_ID": "99",
+            },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--as-file does not support --parse-mode", stderr.getvalue())
 
     def test_send_rejects_malformed_token_without_traceback(self) -> None:
         stderr = io.StringIO()
