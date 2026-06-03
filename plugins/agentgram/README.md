@@ -108,9 +108,13 @@ Agentgram bot chat, then ask the agent to read them. The agent can run:
 ```sh
 agentgram inbox
 agentgram inbox --limit 100
+agentgram inbox --limit 500 --ack
 agentgram inbox --since 3h
 agentgram inbox --include-plain
-agentgram inbox --format json
+agentgram inbox --format compact --output /tmp
+agentgram inbox --format jsonl --output /tmp
+agentgram inbox --include-plain --download-files --download-dir /tmp --ack
+agentgram download-file <file_id> --output /tmp
 ```
 
 The default inbox mode is equivalent to:
@@ -121,27 +125,89 @@ agentgram inbox --limit 100 --since 24h --forwarded-only --format markdown --pee
 
 `--forwarded-only` excludes direct notes sent to the bot. Use
 `--include-plain` when the forwarded context is mixed with direct notes to the
-agent. `--format markdown` is intended for human-readable agent context, while
-`--format json` emits stable records for tools.
+agent. `--format markdown` is intended for human-readable transcripts,
+`--format compact` is line-oriented context for agents, `--format json` emits a
+single stable JSON array, and `--format jsonl` emits one stable JSON record per
+line.
 
 Inbox reads pending Telegram Bot API updates only. It is not full Telegram chat
-history, does not use MTProto user sessions, does not run a webhook receiver,
-and does not store message text, captions, sender names, raw updates, or
-transcripts in local files. Pending updates can expire, and they can be consumed
-by another process using the same bot token.
+history, does not use MTProto user sessions, and does not run a webhook
+receiver. By default, Agentgram does not store message text, captions, sender
+names, raw updates, or transcripts in local files. `--output PATH` is the
+explicit exception for large imports and writes only to the path requested by
+the user or agent. Pending updates can expire, and they can be consumed by
+another process using the same bot token.
 
 `agentgram inbox` defaults to `--peek`, so repeated runs do not consume updates.
-Use `--ack` only after a successful import, or when you explicitly want to
-consume the rendered updates:
+Peek reads are capped at 100 pending updates, matching Telegram's per-call
+`getUpdates` limit. Use `--ack` only after a successful import, or when you
+explicitly want to consume the rendered updates:
 
 ```sh
 agentgram inbox --ack
+agentgram inbox --limit 370 --ack
 ```
 
-Telegram acknowledges updates by offset, which also consumes all lower pending
-update ids. Agentgram refuses to ack when doing so would skip fetched updates
-that were filtered out and not rendered. Rerun with `--include-plain` or a
-narrower filter if that happens.
+With `--ack`, Agentgram can consume up to 500 pending updates by reading
+Telegram in batches of 100 and acknowledging each rendered batch after it has
+been printed or flushed to the requested output file. `--format json` is
+available for single-batch reads up to 100 updates; use `jsonl` for structured
+multi-batch imports. Telegram acknowledges updates by offset, which also
+consumes all lower pending update ids. Agentgram refuses to ack when doing so
+would skip fetched updates that were filtered out and not rendered. Rerun with
+`--include-plain` or a narrower filter if that happens.
+
+For large agent imports, prefer a temporary explicit output file so terminal
+output truncation does not drop the middle of the forwarded context:
+
+```sh
+agentgram inbox --limit 370 --ack --format compact --output /tmp
+sed -n '1,120p' /tmp/agentgram-inbox-YYYYMMDDTHHMMSSZ-PID.txt
+rm -- /tmp/agentgram-inbox-YYYYMMDDTHHMMSSZ-PID.txt
+```
+
+When `--output` points to a directory, Agentgram creates a unique private file
+with mode `0600`, prints a receipt with the path, byte count, SHA-256 digest,
+and suggested read/delete commands, and keeps message content out of stdout.
+It refuses to overwrite existing output files. Use `--output -` to force stdout.
+
+### Telegram File Downloads
+
+To let an agent read a file from Telegram, send or forward the file to the
+Agentgram bot chat. Sending a file only to your own saved messages is not
+visible to the bot. The agent can then run:
+
+```sh
+agentgram inbox --include-plain --download-files --download-dir /tmp --ack
+```
+
+`--download-files` downloads file attachments from the rendered inbox records.
+Supported attachment types include documents, photos, audio, video, animations,
+voice messages, and video notes. `--download-dir` is created if it is missing;
+when omitted, Agentgram creates a private temporary directory. Downloaded files
+use safe local names, are written with mode `0600`, never overwrite an existing
+file, and produce receipts with path, byte count, SHA-256 digest, read hints,
+and delete hints. Telegram file URLs are never printed because they contain the
+bot token.
+
+With `--ack`, Agentgram acknowledges the fetched Telegram updates only after
+the inbox records are rendered and all requested files download successfully.
+If a download fails, the fetched updates are left pending so the user can retry
+or choose a narrower command.
+
+For advanced workflows where an agent already has a `file_id` from
+`--format json` or `--format jsonl`, download that specific file directly:
+
+```sh
+agentgram download-file <file_id> --output /tmp
+agentgram download-file <file_id> --output /tmp --filename report.pdf
+agentgram download-file <file_id> --output ./report.pdf
+```
+
+The public Telegram Bot API currently limits bot downloads through `getFile` to
+20 MB. Agentgram enforces that limit by default. Telegram's local Bot API server
+is the official future path for larger downloads, but Agentgram does not deploy
+or configure that server.
 
 Forwarded authorship depends on Telegram's `forward_origin` metadata and the
 sender's privacy settings. Agentgram shows the user who forwarded the message to
@@ -192,9 +258,13 @@ When a user asks an agent to send a Telegram message, the agent should:
    text, if setup is valid.
 3. Run `agentgram inbox` when the user asks to read recently forwarded Telegram
    messages.
-4. Confirm ambiguous file paths before sending and never send generated files
+4. Run `agentgram inbox --include-plain --download-files --download-dir /tmp
+   --ack` when the user asks to download and inspect a file they sent or
+   forwarded to the Agentgram bot. If multiple files are present, list them and
+   ask which one to inspect.
+5. Confirm ambiguous file paths before sending and never send generated files
    automatically just because a task completed.
-5. Avoid direct Telegram API calls unless the user explicitly asks to bypass the
+6. Avoid direct Telegram API calls unless the user explicitly asks to bypass the
    Agentgram CLI.
 
 ## Troubleshooting
@@ -209,6 +279,8 @@ When a user asks an agent to send a Telegram message, the agent should:
   `agentgram send --as-file --filename <name>` to deliver it as a document.
 - File rejected: verify the path is a readable, non-empty regular file at or
   below Telegram's bot upload limit.
+- Download rejected: verify the file was sent or forwarded to the Agentgram bot
+  chat and is within the public Bot API download limit of 20 MB.
 - Forbidden chat: add the bot to the target chat or start a private chat with
   it, then retry after confirming the chat id.
 - Inbox is empty: forward messages to the bot chat and rerun before Telegram's

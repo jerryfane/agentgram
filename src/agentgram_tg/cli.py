@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
 from .telegram import (
+    MAX_DOWNLOAD_BYTES,
     MAX_DOCUMENT_BYTES,
     TelegramClient,
     TelegramError,
@@ -28,6 +31,8 @@ from .telegram import (
 
 MAX_TEXT_LENGTH = 4096
 MAX_CAPTION_LENGTH = 1024
+TELEGRAM_UPDATE_LIMIT = 100
+MAX_INBOX_LIMIT = 500
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
 PLUGIN_NAME = "agentgram"
@@ -96,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inbox = subcommands.add_parser("inbox", help="read recent messages forwarded to the bot")
     inbox.add_argument("--chat-id", help=f"override {CHAT_ID_ENV}")
-    inbox.add_argument("--limit", type=int, default=100, help="maximum pending updates to read, from 1 to 100")
+    inbox.add_argument("--limit", type=int, default=100, help="maximum pending updates to read; 1-100 for peek, 1-500 with --ack")
     inbox.add_argument("--since", default="24h", help="only include messages newer than this duration, e.g. 15m, 3h, 1d")
     inbox_filter = inbox.add_mutually_exclusive_group()
     inbox_filter.add_argument(
@@ -124,8 +129,34 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ack",
         help="consume rendered updates after successful output",
     )
-    inbox.set_defaults(func=cmd_inbox, include_plain=False, output_format="markdown", ack=False)
-    inbox.add_argument("--format", choices=("markdown", "json"), default="markdown", dest="output_format")
+    inbox.set_defaults(func=cmd_inbox, include_plain=False, output_format="markdown", output=None, ack=False)
+    inbox.add_argument(
+        "--format",
+        choices=("markdown", "compact", "json", "jsonl"),
+        default="markdown",
+        dest="output_format",
+    )
+    inbox.add_argument("--output", help="write inbox output to PATH, a directory, or '-' for stdout")
+    inbox.add_argument("--download-files", action="store_true", help="download file attachments from rendered inbox records")
+    inbox.add_argument("--download-dir", help="directory for --download-files; created if missing")
+    inbox.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=MAX_DOWNLOAD_BYTES,
+        help=f"maximum bytes per downloaded Telegram file; default {MAX_DOWNLOAD_BYTES}",
+    )
+
+    download_file = subcommands.add_parser("download-file", help="download a Telegram file by file_id")
+    download_file.add_argument("file_id", help="Telegram file_id from inbox JSON or JSONL output")
+    download_file.add_argument("--output", required=True, help="destination file path or directory")
+    download_file.add_argument("--filename", help="safe filename to use when --output is a directory")
+    download_file.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=MAX_DOWNLOAD_BYTES,
+        help=f"maximum bytes to download; default {MAX_DOWNLOAD_BYTES}",
+    )
+    download_file.set_defaults(func=cmd_download_file)
 
     doctor = subcommands.add_parser("doctor", help="check Agentgram and Telegram configuration")
     doctor.add_argument("--json", action="store_true", dest="json_output", help="print JSON")
@@ -278,28 +309,72 @@ def cmd_chat_id(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, 
 def cmd_inbox(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str]) -> int:
     token = require_env(environ, TOKEN_ENV)
     chat_id = args.chat_id or require_env(environ, CHAT_ID_ENV)
-    limit = validate_inbox_limit(args.limit)
+    limit = validate_inbox_limit(args.limit, ack=args.ack, output_format=args.output_format)
+    download_files = bool(getattr(args, "download_files", False))
+    download_dir = getattr(args, "download_dir", None)
+    max_file_bytes = validate_max_file_bytes(getattr(args, "max_file_bytes", MAX_DOWNLOAD_BYTES))
+    if download_dir and not download_files:
+        raise CliError("--download-dir requires --download-files")
     since_seconds = parse_duration(args.since)
     client = TelegramClient(token)
-    updates = client.get_updates(
-        limit,
-        timeout=0,
-        allowed_updates=["message"],
+    output = InboxOutput(args.output, output_format=args.output_format, stdout=stdout)
+    downloader = InboxDownloader(download_dir, max_file_bytes=max_file_bytes) if download_files else None
+    result = 0
+    try:
+        if args.ack:
+            result = read_acknowledged_inbox(
+                client,
+                chat_id=chat_id,
+                limit=limit,
+                since_seconds=since_seconds,
+                include_plain=args.include_plain,
+                output=output,
+                downloader=downloader,
+                now=int(time.time()),
+            )
+        else:
+            updates = client.get_updates(
+                limit,
+                timeout=0,
+                allowed_updates=["message"],
+            )
+            records = inbox_records(
+                updates,
+                chat_id=chat_id,
+                since_seconds=since_seconds,
+                include_plain=args.include_plain,
+                now=int(time.time()),
+            )
+            if downloader is not None:
+                downloader.download_records(client, records)
+            output.note_updates(updates)
+            output.write_records(records)
+
+    finally:
+        output.close()
+        output.print_receipt()
+        if downloader is not None and should_print_download_receipts(output):
+            downloader.print_receipt(stdout)
+    return result
+
+
+def cmd_download_file(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str]) -> int:
+    token = require_env(environ, TOKEN_ENV)
+    max_file_bytes = validate_max_file_bytes(args.max_file_bytes)
+    client = TelegramClient(token)
+    telegram_file = client.get_file(args.file_id)
+    file_path = telegram_file.get("file_path")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise CliError("Telegram did not return a downloadable file_path; the file may be too large")
+    file_name = args.filename or file_name_from_telegram_path(file_path)
+    target = resolve_download_output(args.output, file_name=file_name, explicit_filename=bool(args.filename))
+    receipt = download_telegram_file(
+        client,
+        telegram_file=telegram_file,
+        target=target,
+        max_file_bytes=max_file_bytes,
     )
-    records = inbox_records(
-        updates,
-        chat_id=chat_id,
-        since_seconds=since_seconds,
-        include_plain=args.include_plain,
-        now=int(time.time()),
-    )
-    if args.output_format == "json":
-        output = json.dumps(records, indent=2, sort_keys=True)
-    else:
-        output = render_inbox_markdown(records)
-    print(output, file=stdout)
-    if args.ack:
-        acknowledge_inbox_records(client, updates, records)
+    print_download_receipts([receipt], stdout)
     return 0
 
 
@@ -469,9 +544,23 @@ def validate_text_filename(filename: str | None) -> str:
     return name
 
 
-def validate_inbox_limit(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 100:
-        raise CliError("limit must be from 1 to 100")
+def validate_inbox_limit(value: int, *, ack: bool, output_format: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > MAX_INBOX_LIMIT:
+        raise CliError(f"limit must be from 1 to {MAX_INBOX_LIMIT}")
+    if value > TELEGRAM_UPDATE_LIMIT and not ack:
+        raise CliError(f"limit above {TELEGRAM_UPDATE_LIMIT} requires --ack")
+    if value > TELEGRAM_UPDATE_LIMIT and output_format == "json":
+        raise CliError(f"--format json does not support --limit above {TELEGRAM_UPDATE_LIMIT}")
+    return value
+
+
+def validate_max_file_bytes(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise CliError("max file bytes must be a positive integer")
+    if value > MAX_DOWNLOAD_BYTES:
+        raise CliError(
+            f"max file bytes cannot exceed the public Bot API download limit of {MAX_DOWNLOAD_BYTES} bytes"
+        )
     return value
 
 
@@ -521,6 +610,7 @@ def inbox_records(
                 "forwarded_by": render_user(message.get("from")),
                 "origin": render_forward_origin(forward_origin) if forwarded else plain_origin(),
                 "content": extract_message_content(message),
+                "attachments": extract_message_attachments(message),
             }
         )
     return sorted(records, key=lambda item: (item["date"], item.get("update_id") or 0, item.get("message_id") or 0))
@@ -539,12 +629,388 @@ def render_inbox_markdown(records: list[dict[str, Any]]) -> str:
                     f"- Chat: {record['chat']['label']}",
                     f"- Forwarded by: {record['forwarded_by']['label']}",
                     f"- Original source: {origin['source']}",
+                    *render_attachment_markdown_lines(record.get("attachments")),
                     "",
                     record["content"],
                 ]
             )
         )
     return "\n\n".join(sections)
+
+
+def render_inbox_compact(records: list[dict[str, Any]], *, start_index: int = 1) -> str:
+    if not records:
+        return "No inbox messages found."
+    lines: list[str] = []
+    for index, record in enumerate(records, start=start_index):
+        speaker = inbox_record_speaker(record)
+        content = one_line_text(str(record["content"]))
+        attachments = compact_attachment_summary(record.get("attachments"))
+        if attachments:
+            content = f"{content} | attachments: {attachments}"
+        lines.append(f"{index}. [{record['date_iso']}] {speaker}: {content}")
+    return "\n".join(lines)
+
+
+def render_attachment_markdown_lines(attachments: Any) -> list[str]:
+    if not isinstance(attachments, list) or not attachments:
+        return []
+    lines = ["- Attachments:"]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        label = attachment_label(attachment)
+        download = attachment.get("download")
+        if isinstance(download, dict) and download.get("path"):
+            lines.append(f"  - {label} -> {download['path']}")
+        else:
+            lines.append(f"  - {label}")
+    return lines
+
+
+def attachment_label(attachment: dict[str, Any]) -> str:
+    parts = [str(attachment.get("kind") or "file")]
+    file_name = attachment.get("file_name")
+    if isinstance(file_name, str) and file_name:
+        parts.append(file_name)
+    file_size = attachment.get("file_size")
+    if isinstance(file_size, int):
+        parts.append(f"{file_size} bytes")
+    return " ".join(parts)
+
+
+def compact_attachment_summary(attachments: Any) -> str:
+    if not isinstance(attachments, list) or not attachments:
+        return ""
+    labels: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        label = attachment_label(attachment)
+        download = attachment.get("download")
+        if isinstance(download, dict) and download.get("path"):
+            label = f"{label} -> {download['path']}"
+        labels.append(label)
+    return "; ".join(labels)
+
+
+def inbox_record_speaker(record: dict[str, Any]) -> str:
+    if record.get("forwarded"):
+        origin = record.get("origin")
+        if isinstance(origin, dict):
+            source = origin.get("source")
+            if isinstance(source, str) and source:
+                return source
+    forwarded_by = record.get("forwarded_by")
+    if isinstance(forwarded_by, dict):
+        label = forwarded_by.get("label")
+        if isinstance(label, str) and label:
+            return label
+    return "unknown user"
+
+
+def one_line_text(value: str) -> str:
+    collapsed = re.sub(r"\s+", " ", value).strip()
+    return collapsed or "[empty]"
+
+
+def render_inbox_jsonl(records: list[dict[str, Any]]) -> str:
+    return "\n".join(json.dumps(record, sort_keys=True) for record in records)
+
+
+def render_inbox_output(records: list[dict[str, Any]], output_format: str, *, start_index: int = 1) -> str:
+    if output_format == "json":
+        return json.dumps(records, indent=2, sort_keys=True)
+    if output_format == "jsonl":
+        return render_inbox_jsonl(records)
+    if output_format == "compact":
+        return render_inbox_compact(records, start_index=start_index)
+    return render_inbox_markdown(records)
+
+
+class InboxOutput:
+    def __init__(self, output_path: str | None, *, output_format: str, stdout: TextIO) -> None:
+        self.output_format = output_format
+        self.stdout = stdout
+        self.handle: TextIO | None = None
+        self.path: Path | None = None
+        self.record_count = 0
+        self.update_count = 0
+        self.byte_count = 0
+        self.hasher = hashlib.sha256()
+        self.next_index = 1
+        if output_path and output_path != "-":
+            self.path, self.handle = create_inbox_output_file(output_path, output_format=output_format)
+
+    def note_updates(self, updates: list[dict[str, Any]]) -> None:
+        self.update_count += len(updates)
+
+    def write_records(self, records: list[dict[str, Any]]) -> None:
+        rendered = render_inbox_output(records, self.output_format, start_index=self.next_index)
+        if self.handle is None and rendered:
+            print(rendered, file=self.stdout)
+        elif rendered:
+            self._write_file_text(rendered)
+        self.record_count += len(records)
+        self.next_index += len(records)
+
+    def _write_file_text(self, text: str) -> None:
+        if self.handle is None:
+            raise CliError("inbox output file is not open")
+        data = f"{text}\n".encode("utf-8")
+        self.handle.write(data.decode("utf-8"))
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.byte_count += len(data)
+        self.hasher.update(data)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+    def print_receipt(self) -> None:
+        if self.path is None:
+            return
+        quoted_path = shlex.quote(str(self.path))
+        print(
+            f"wrote inbox records={self.record_count} updates={self.update_count} "
+            f"format={self.output_format} bytes={self.byte_count} sha256={self.hasher.hexdigest()}",
+            file=self.stdout,
+        )
+        print(f"path={self.path}", file=self.stdout)
+        print(f"read chunks: sed -n '1,120p' {quoted_path}", file=self.stdout)
+        print(f"delete after import: rm -- {quoted_path}", file=self.stdout)
+
+
+class InboxDownloader:
+    def __init__(self, download_dir: str | None, *, max_file_bytes: int) -> None:
+        self.download_dir = download_dir
+        self._path: Path | None = None
+        self.max_file_bytes = max_file_bytes
+        self.receipts: list[dict[str, Any]] = []
+
+    @property
+    def path(self) -> Path:
+        if self._path is None:
+            self._path = resolve_download_dir(self.download_dir)
+        return self._path
+
+    def download_records(self, client: TelegramClient, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            attachments = record.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                target = next_available_path(self.path / sanitize_download_filename(str(attachment["file_name"])))
+                receipt = download_attachment(client, attachment, target=target, max_file_bytes=self.max_file_bytes)
+                attachment["download"] = receipt
+                self.receipts.append(receipt)
+
+    def print_receipt(self, stdout: TextIO) -> None:
+        print_download_receipts(self.receipts, stdout)
+
+
+def should_print_download_receipts(output: InboxOutput) -> bool:
+    if output.path is not None:
+        return True
+    return output.output_format not in {"json", "jsonl"}
+
+
+def resolve_download_dir(download_dir: str | None) -> Path:
+    if download_dir is None:
+        path = Path(tempfile.mkdtemp(prefix="agentgram-downloads-"))
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        return path
+    path = Path(download_dir).expanduser()
+    if path.exists() and not path.is_dir():
+        raise CliError(f"download path is not a directory: {path}")
+    if not path.exists():
+        try:
+            path.mkdir(mode=0o700, parents=True)
+        except OSError as exc:
+            raise CliError(f"cannot create download directory {path}: {exc}") from exc
+    return path
+
+
+def resolve_download_output(output: str, *, file_name: str, explicit_filename: bool) -> Path:
+    requested = Path(output).expanduser()
+    safe_name = sanitize_download_filename(file_name)
+    if explicit_filename:
+        if requested.exists() and not requested.is_dir():
+            raise CliError("--filename requires --output to be a directory")
+        if not requested.exists():
+            try:
+                requested.mkdir(mode=0o700, parents=True)
+            except OSError as exc:
+                raise CliError(f"cannot create download directory {requested}: {exc}") from exc
+        return next_available_path(requested / safe_name)
+    if requested.exists() and requested.is_dir():
+        return next_available_path(requested / safe_name)
+    if requested.exists():
+        raise CliError(f"refusing to overwrite existing file: {requested}")
+    parent = requested.parent
+    if not parent.exists() or not parent.is_dir():
+        raise CliError(f"download parent directory does not exist: {parent}")
+    return requested
+
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem or "file"
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise CliError(f"cannot find available filename for {path}")
+
+
+def download_attachment(
+    client: TelegramClient,
+    attachment: dict[str, Any],
+    *,
+    target: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    file_id = attachment.get("file_id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        raise CliError("attachment is missing file_id")
+    file_size = attachment.get("file_size")
+    if isinstance(file_size, int) and not isinstance(file_size, bool) and file_size > max_file_bytes:
+        raise CliError(f"file is too large: {file_size} bytes; maximum is {max_file_bytes} bytes")
+    telegram_file = client.get_file(file_id)
+    return download_telegram_file(client, telegram_file=telegram_file, target=target, max_file_bytes=max_file_bytes)
+
+
+def download_telegram_file(
+    client: TelegramClient,
+    *,
+    telegram_file: dict[str, Any],
+    target: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    file_path = telegram_file.get("file_path")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise CliError("Telegram did not return a downloadable file_path; the file may be too large")
+    file_size = telegram_file.get("file_size")
+    expected_size = file_size if isinstance(file_size, int) and not isinstance(file_size, bool) else None
+    result = client.download_file(
+        file_path,
+        target,
+        expected_size=expected_size,
+        max_bytes=max_file_bytes,
+    )
+    return {
+        "path": result["path"],
+        "bytes": result["bytes"],
+        "sha256": result["sha256"],
+        "file_id": telegram_file.get("file_id") or "",
+        "file_unique_id": telegram_file.get("file_unique_id") or "",
+    }
+
+
+def print_download_receipts(receipts: list[dict[str, Any]], stdout: TextIO) -> None:
+    if not receipts:
+        return
+    print(f"downloaded files={len(receipts)}", file=stdout)
+    for receipt in receipts:
+        quoted_path = shlex.quote(str(receipt["path"]))
+        print(
+            f"path={receipt['path']} bytes={receipt['bytes']} sha256={receipt['sha256']}",
+            file=stdout,
+        )
+        print(f"read file: {quoted_path}", file=stdout)
+        print(f"delete after import: rm -- {quoted_path}", file=stdout)
+
+
+def file_name_from_telegram_path(file_path: str) -> str:
+    return sanitize_download_filename(file_path.rsplit("/", 1)[-1] or "telegram-file")
+
+
+def create_inbox_output_file(output_path: str, *, output_format: str) -> tuple[Path, TextIO]:
+    requested = Path(output_path).expanduser()
+    if requested.exists() and requested.is_dir():
+        target = requested / unique_inbox_output_name(output_format)
+    else:
+        target = requested
+    parent = target.parent
+    if not parent.exists() or not parent.is_dir():
+        raise CliError(f"inbox output parent directory does not exist: {parent}")
+    if target.exists():
+        raise CliError(f"refusing to overwrite existing inbox output file: {target}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(target, flags, 0o600)
+    except FileExistsError as exc:
+        raise CliError(f"refusing to overwrite existing inbox output file: {target}") from exc
+    except OSError as exc:
+        raise CliError(f"cannot create inbox output file {target}: {exc}") from exc
+    return target, os.fdopen(fd, "w", encoding="utf-8")
+
+
+def unique_inbox_output_name(output_format: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"agentgram-inbox-{timestamp}-{os.getpid()}.{inbox_output_extension(output_format)}"
+
+
+def inbox_output_extension(output_format: str) -> str:
+    if output_format == "json":
+        return "json"
+    if output_format == "jsonl":
+        return "jsonl"
+    if output_format == "compact":
+        return "txt"
+    return "md"
+
+
+def read_acknowledged_inbox(
+    client: TelegramClient,
+    *,
+    chat_id: str,
+    limit: int,
+    since_seconds: int,
+    include_plain: bool,
+    output: InboxOutput,
+    downloader: InboxDownloader | None,
+    now: int,
+) -> int:
+    remaining = limit
+    wrote_output = False
+    while remaining > 0:
+        batch_limit = min(TELEGRAM_UPDATE_LIMIT, remaining)
+        updates = client.get_updates(batch_limit, timeout=0, allowed_updates=["message"])
+        if not updates:
+            if not wrote_output:
+                output.write_records([])
+            break
+        output.note_updates(updates)
+        records = inbox_records(
+            updates,
+            chat_id=chat_id,
+            since_seconds=since_seconds,
+            include_plain=include_plain,
+            now=now,
+        )
+        if not records and wrote_output:
+            break
+        if downloader is not None:
+            downloader.download_records(client, records)
+        output.write_records(records)
+        wrote_output = True
+        if not records:
+            break
+        acknowledge_inbox_records(client, updates, records)
+        remaining -= len(updates)
+        if len(updates) < batch_limit:
+            break
+    return 0
 
 
 def acknowledge_inbox_records(
@@ -578,6 +1044,148 @@ def acknowledge_inbox_records(
         timeout=0,
         allowed_updates=["message"],
     )
+
+
+def extract_message_attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    message_id = message.get("message_id")
+    caption = message.get("caption") if isinstance(message.get("caption"), str) else None
+    for kind in ("document", "audio", "video", "animation", "voice", "video_note"):
+        value = message.get(kind)
+        if isinstance(value, dict):
+            attachment = attachment_from_file_object(kind, value, message_id=message_id, caption=caption)
+            if attachment is not None:
+                attachments.append(attachment)
+    photo = message.get("photo")
+    if isinstance(photo, list):
+        best_photo = largest_photo_size(photo)
+        if best_photo is not None:
+            attachment = attachment_from_file_object("photo", best_photo, message_id=message_id, caption=caption)
+            if attachment is not None:
+                attachments.append(attachment)
+    return attachments
+
+
+def attachment_from_file_object(
+    kind: str,
+    value: dict[str, Any],
+    *,
+    message_id: Any,
+    caption: str | None,
+) -> dict[str, Any] | None:
+    file_id = value.get("file_id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        return None
+    file_unique_id = value.get("file_unique_id")
+    file_size = value.get("file_size")
+    file_name = telegram_file_name(kind, value, message_id=message_id)
+    return {
+        "kind": kind,
+        "file_id": file_id,
+        "file_unique_id": file_unique_id if isinstance(file_unique_id, str) else "",
+        "file_name": file_name["name"],
+        "file_name_source": file_name["source"],
+        "mime_type": value.get("mime_type") if isinstance(value.get("mime_type"), str) else "",
+        "file_size": file_size if isinstance(file_size, int) and not isinstance(file_size, bool) else None,
+        "caption": caption or "",
+    }
+
+
+def largest_photo_size(values: list[Any]) -> dict[str, Any] | None:
+    candidates = [value for value in values if isinstance(value, dict) and isinstance(value.get("file_id"), str)]
+    if not candidates:
+        return None
+    return max(candidates, key=photo_size_score)
+
+
+def photo_size_score(value: dict[str, Any]) -> tuple[int, int]:
+    file_size = value.get("file_size")
+    if isinstance(file_size, int) and not isinstance(file_size, bool):
+        size_score = file_size
+    else:
+        width = value.get("width")
+        height = value.get("height")
+        size_score = width * height if isinstance(width, int) and isinstance(height, int) else 0
+    return (size_score, len(str(value.get("file_id") or "")))
+
+
+def telegram_file_name(kind: str, value: dict[str, Any], *, message_id: Any) -> dict[str, str]:
+    generated = generated_attachment_filename(kind, value, message_id=message_id)
+    provided = value.get("file_name")
+    if isinstance(provided, str) and provided.strip():
+        return {"name": sanitize_telegram_filename(provided, fallback=generated), "source": "telegram"}
+    title = value.get("title")
+    if kind == "audio" and isinstance(title, str) and title.strip():
+        return {"name": sanitize_telegram_filename(title, fallback=generated), "source": "telegram"}
+    return {"name": generated, "source": "generated"}
+
+
+def generated_attachment_filename(kind: str, value: dict[str, Any], *, message_id: Any) -> str:
+    safe_identifier = attachment_identifier_digest(value)
+    safe_message_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(message_id or "message")).strip(".-") or "message"
+    return f"{kind}-{safe_message_id}-{safe_identifier}{default_extension(kind, value)}"
+
+
+def attachment_identifier_digest(value: dict[str, Any]) -> str:
+    identifier = value.get("file_unique_id") or value.get("file_id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        return "file"
+    digest = hashlib.sha256(identifier.strip().encode("utf-8")).hexdigest()[:16]
+    return f"id-{digest}"
+
+
+def default_extension(kind: str, value: dict[str, Any]) -> str:
+    mime_type = value.get("mime_type")
+    if isinstance(mime_type, str):
+        guessed = {
+            "application/pdf": ".pdf",
+            "audio/mpeg": ".mp3",
+            "audio/ogg": ".ogg",
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "text/plain": ".txt",
+            "video/mp4": ".mp4",
+            "video/quicktime": ".mov",
+        }.get(mime_type.lower())
+        if guessed:
+            return guessed
+    return {
+        "animation": ".gif",
+        "audio": ".audio",
+        "document": ".bin",
+        "photo": ".jpg",
+        "video": ".mp4",
+        "video_note": ".mp4",
+        "voice": ".ogg",
+    }.get(kind, ".bin")
+
+
+def sanitize_download_filename(value: str) -> str:
+    raw = value.strip()
+    if "/" in raw or "\\" in raw or Path(raw).name != raw:
+        raise CliError("download filename must be a file name, not a path")
+    return normalize_safe_filename(raw)
+
+
+def sanitize_telegram_filename(value: str, *, fallback: str) -> str:
+    candidate = re.sub(r"[\x00-\x1f/\\]+", "_", value.strip())
+    try:
+        return normalize_safe_filename(candidate)
+    except CliError:
+        return fallback
+
+
+def normalize_safe_filename(value: str) -> str:
+    name = Path(value).name
+    name = re.sub(r"[\x00-\x1f/\\]+", "_", name).strip()
+    name = name.strip(".")
+    if not name or name in {".", ".."}:
+        raise CliError("download filename is invalid")
+    if len(name) > 160:
+        stem = Path(name).stem[:120].strip(".") or "file"
+        suffix = Path(name).suffix[:20]
+        name = f"{stem}{suffix}"
+    return name
 
 
 def extract_message_content(message: dict[str, Any]) -> str:
