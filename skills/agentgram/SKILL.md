@@ -109,11 +109,12 @@ pending forwarded messages without consuming them. Peek reads support at most
 100 pending updates. Use `$AGENTGRAM_CMD inbox --limit 370 --ack --format
 compact --output /tmp` when the user asks to read and consume a larger
 forwarded batch, such as "the last 370 messages"; acknowledged reads support up
-to 500 pending updates and read Telegram in 100-update batches. Use
-`$AGENTGRAM_CMD inbox --since 3h` when the user asks for messages from the last
-3 hours. Use `$AGENTGRAM_CMD inbox --include-plain` when the user says they
-also sent direct notes to the bot, or that the forwarded context is mixed with
-direct messages.
+to 500 pending updates, read Telegram in 100-update batches, stage each rendered
+batch durably before acknowledging it, and render the final output globally
+sorted after all batches are imported. Use `$AGENTGRAM_CMD inbox --since 3h`
+when the user asks for messages from the last 3 hours. Use
+`$AGENTGRAM_CMD inbox --include-plain` when the user says they also sent direct
+notes to the bot, or that the forwarded context is mixed with direct messages.
 
 The default inbox mode is `--peek`, which reads without consuming Telegram
 updates. Use `$AGENTGRAM_CMD inbox --ack` only after a successful import, or
@@ -136,7 +137,10 @@ Agentgram does not write message content, captions, sender names, raw updates,
 or transcripts to local files unless the user or agent explicitly passes
 `--output PATH`. Forwarded authorship depends on Telegram `forward_origin`
 metadata and sender privacy settings; hidden or uncertain authors are marked in
-the output.
+the output. Forwarded inbox output is ordered by the original Telegram
+`forward_origin.date` when available, with bot receive order as the tie-breaker.
+In JSON/JSONL, `original_date_iso` is the original group timestamp and
+`date_iso` is when the forwarded copy reached the Agentgram bot.
 
 Use `$AGENTGRAM_CMD inbox --include-plain --download-files --download-dir /tmp
 --ack` when the user asks to download or inspect a file they sent or forwarded

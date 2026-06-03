@@ -297,8 +297,8 @@ class InboxTests(unittest.TestCase):
         stdout = io.StringIO()
         with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_updates.return_value = [
-                self.update(3, 30, 1_700_000_030, text="newest", origin=self.origin_hidden_user("Hidden Ada")),
-                self.update(1, 10, 1_700_000_010, text="oldest", origin=self.origin_user("Grace")),
+                self.update(3, 30, 1_700_000_030, text="newest", origin=self.origin_hidden_user("Hidden Ada", date=1_700_000_030)),
+                self.update(1, 10, 1_700_000_010, text="oldest", origin=self.origin_user("Grace", date=1_700_000_010)),
                 self.update(2, 20, 1_700_000_020, text="plain", origin=None),
             ]
             with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_040):
@@ -322,6 +322,8 @@ class InboxTests(unittest.TestCase):
         self.assertIn("# Agentgram Inbox", output)
         self.assertLess(output.find("oldest"), output.find("newest"))
         self.assertIn("Original source: Grace", output)
+        self.assertIn("Original sent at: 2023-11-14T22:13:30Z", output)
+        self.assertIn("Forwarded received at: 2023-11-14T22:13:30Z", output)
         self.assertIn("Hidden Ada (privacy-hidden user)", output)
         self.assertNotIn("plain", output)
 
@@ -388,7 +390,13 @@ class InboxTests(unittest.TestCase):
         stdout = io.StringIO()
         with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_updates.return_value = [
-                self.update(1, 10, 1_700_000_000, text="hello", origin=self.origin_user("Ada", username="ada")),
+                self.update(
+                    1,
+                    10,
+                    1_700_000_000,
+                    text="hello",
+                    origin=self.origin_user("Ada", username="ada", date=1_699_999_990),
+                ),
             ]
             with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
                 code = cli.run(
@@ -407,6 +415,63 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(payload[0]["origin"]["type"], "user")
         self.assertEqual(payload[0]["origin"]["source"], "Ada (@ada)")
         self.assertEqual(payload[0]["date_iso"], "2023-11-14T22:13:20Z")
+        self.assertEqual(payload[0]["original_date"], 1_699_999_990)
+        self.assertEqual(payload[0]["original_date_iso"], "2023-11-14T22:13:10Z")
+        self.assertEqual(payload[0]["received_index"], 1)
+
+    def test_inbox_orders_forwarded_records_by_original_time(self) -> None:
+        updates = [
+            self.update(1, 10, 1_700_000_030, text="third received first", origin=self.origin_user("Ada", date=1_700_000_003)),
+            self.update(2, 20, 1_700_000_010, text="first received second", origin=self.origin_user("Ada", date=1_700_000_001)),
+            self.update(3, 30, 1_700_000_020, text="second received third", origin=self.origin_user("Ada", date=1_700_000_002)),
+        ]
+
+        records = cli.inbox_records(
+            updates,
+            chat_id="99",
+            since_seconds=60,
+            include_plain=False,
+            now=1_700_000_040,
+        )
+
+        self.assertEqual(
+            [record["content"] for record in records],
+            ["first received second", "second received third", "third received first"],
+        )
+
+    def test_inbox_original_time_ties_keep_received_order(self) -> None:
+        updates = [
+            self.update(1, 10, 1_700_000_010, text="first", origin=self.origin_user("Ada", date=1_700_000_000)),
+            self.update(2, 20, 1_700_000_011, text="second", origin=self.origin_user("Ada", date=1_700_000_000)),
+        ]
+
+        records = cli.inbox_records(
+            updates,
+            chat_id="99",
+            since_seconds=60,
+            include_plain=False,
+            now=1_700_000_040,
+        )
+
+        self.assertEqual([record["content"] for record in records], ["first", "second"])
+        self.assertEqual([record["received_index"] for record in records], [1, 2])
+
+    def test_include_plain_preserves_chronological_position(self) -> None:
+        updates = [
+            self.update(1, 10, 1_700_000_010, text="forwarded first", origin=self.origin_user("Ada", date=1_700_000_010)),
+            self.update(2, 20, 1_700_000_020, text="plain middle", origin=None),
+            self.update(3, 30, 1_700_000_030, text="forwarded last", origin=self.origin_user("Ada", date=1_700_000_030)),
+        ]
+
+        records = cli.inbox_records(
+            updates,
+            chat_id="99",
+            since_seconds=60,
+            include_plain=True,
+            now=1_700_000_040,
+        )
+
+        self.assertEqual([record["content"] for record in records], ["forwarded first", "plain middle", "forwarded last"])
 
     def test_compact_output_emits_line_oriented_context(self) -> None:
         stdout = io.StringIO()
@@ -417,7 +482,7 @@ class InboxTests(unittest.TestCase):
                     10,
                     1_700_000_000,
                     text="hello\n\nworld",
-                    origin=self.origin_user("Ada", username="ada"),
+                    origin=self.origin_user("Ada", username="ada", date=1_699_999_990),
                 ),
             ]
             with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
@@ -434,7 +499,7 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             stdout.getvalue().strip(),
-            "1. [2023-11-14T22:13:20Z] Ada (@ada): hello world",
+            "1. [2023-11-14T22:13:10Z] Ada (@ada): hello world",
         )
 
     def test_compact_output_includes_downloaded_attachment_context(self) -> None:
@@ -1089,16 +1154,22 @@ class InboxTests(unittest.TestCase):
             ]
         )
 
-    def test_inbox_ack_writes_large_jsonl_file_before_each_ack(self) -> None:
+    def test_inbox_ack_writes_large_jsonl_file_after_global_ordering(self) -> None:
         stdout = io.StringIO()
         events: list[str] = []
         first_batch = [
-            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"jsonl-one-{update_id}", origin=self.origin_user("Ada"))
+            self.update(
+                update_id,
+                update_id,
+                1_700_000_000 + update_id,
+                text=f"jsonl-one-{update_id}",
+                origin=self.origin_user("Ada", date=1_700_001_000 + update_id),
+            )
             for update_id in range(1, 101)
         ]
         second_batch = [
-            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"jsonl-two-{update_id}", origin=self.origin_user("Grace"))
-            for update_id in range(101, 104)
+            self.update(101, 101, 1_700_000_101, text="jsonl-two-early", origin=self.origin_user("Grace", date=1_700_000_001)),
+            self.update(102, 102, 1_700_000_102, text="jsonl-two-later", origin=self.origin_user("Grace", date=1_700_001_200)),
         ]
         fetch_batches = [first_batch, second_batch]
 
@@ -1127,14 +1198,54 @@ class InboxTests(unittest.TestCase):
 
             files = list(output_dir.iterdir())
             self.assertEqual(code, 0)
-            self.assertEqual(events, ["fetch", "fsync", "ack", "fetch", "fsync", "ack"])
+            self.assertEqual(events, ["fetch", "fsync", "ack", "fetch", "fsync", "ack", "fsync"])
             self.assertEqual(len(files), 1)
             lines = files[0].read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(lines), 103)
-            self.assertEqual(json.loads(lines[0])["content"], "jsonl-one-1")
-            self.assertEqual(json.loads(lines[-1])["content"], "jsonl-two-103")
-            self.assertIn("records=103 updates=103 format=jsonl", stdout.getvalue())
+            self.assertEqual(len(lines), 102)
+            self.assertEqual(json.loads(lines[0])["content"], "jsonl-two-early")
+            self.assertEqual(json.loads(lines[1])["content"], "jsonl-one-1")
+            self.assertEqual(json.loads(lines[-1])["content"], "jsonl-two-later")
+            self.assertIn("records=102 updates=102 format=jsonl", stdout.getvalue())
             self.assertNotIn("jsonl-one-1", stdout.getvalue())
+
+    def test_inbox_ack_large_refusal_flushes_staged_records(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        first_batch = [
+            self.update(update_id, update_id, 1_700_000_000, text=f"kept-{update_id}", origin=self.origin_user("Ada"))
+            for update_id in range(1, 101)
+        ]
+        second_batch = [
+            self.update(101, 101, 1_700_000_000, text="plain before", origin=None),
+            self.update(102, 102, 1_700_000_000, text="forwarded after", origin=self.origin_user("Grace")),
+        ]
+        fetch_batches = [first_batch, second_batch]
+
+        def get_updates(limit: int = 100, **kwargs: object) -> list[dict[str, object]]:
+            if "offset" in kwargs:
+                return []
+            self.assertLessEqual(limit, cli.TELEGRAM_UPDATE_LIMIT)
+            return fetch_batches.pop(0)
+
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.side_effect = get_updates
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--limit", "102", "--ack", "--format", "compact"],
+                    stdout=stdout,
+                    stderr=stderr,
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("kept-1", stdout.getvalue())
+        self.assertIn("forwarded after", stdout.getvalue())
+        self.assertNotIn("plain before", stdout.getvalue())
+        self.assertIn("were not rendered", stderr.getvalue())
+        self.assertNotIn("staged inbox records kept at", stderr.getvalue())
 
     def test_inbox_ack_stops_without_ack_when_batch_has_no_records(self) -> None:
         stdout = io.StringIO()
@@ -1350,14 +1461,14 @@ class InboxTests(unittest.TestCase):
             message["forward_origin"] = origin
         return {"update_id": update_id, "message": message}
 
-    def origin_user(self, name: str, *, username: str = "") -> dict[str, object]:
+    def origin_user(self, name: str, *, username: str = "", date: int = 1_700_000_000) -> dict[str, object]:
         user: dict[str, object] = {"id": 123, "first_name": name}
         if username:
             user["username"] = username
-        return {"type": "user", "date": 1_700_000_000, "sender_user": user}
+        return {"type": "user", "date": date, "sender_user": user}
 
-    def origin_hidden_user(self, name: str) -> dict[str, object]:
-        return {"type": "hidden_user", "date": 1_700_000_000, "sender_user_name": name}
+    def origin_hidden_user(self, name: str, *, date: int = 1_700_000_000) -> dict[str, object]:
+        return {"type": "hidden_user", "date": date, "sender_user_name": name}
 
 
 class CliRunTests(unittest.TestCase):

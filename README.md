@@ -149,13 +149,15 @@ agentgram inbox --limit 370 --ack
 ```
 
 With `--ack`, Agentgram can consume up to 500 pending updates by reading
-Telegram in batches of 100 and acknowledging each rendered batch after it has
-been printed or flushed to the requested output file. `--format json` is
-available for single-batch reads up to 100 updates; use `jsonl` for structured
-multi-batch imports. Telegram acknowledges updates by offset, which also
-consumes all lower pending update ids. Agentgram refuses to ack when doing so
-would skip fetched updates that were filtered out and not rendered. Rerun with
-`--include-plain` or a narrower filter if that happens.
+Telegram in batches of 100. Multi-batch reads first write every rendered batch
+to a private JSONL staging file and flush it before acknowledging that batch;
+the final user-facing output is rendered globally sorted after all batches are
+imported. `--format json` is available for single-batch reads up to 100
+updates; use `jsonl` for structured multi-batch imports. Telegram acknowledges
+updates by offset, which also consumes all lower pending update ids. Agentgram
+refuses to ack when doing so would skip fetched updates that were filtered out
+and not rendered. Rerun with `--include-plain` or a narrower filter if that
+happens.
 
 For large agent imports, prefer a temporary explicit output file so terminal
 output truncation does not drop the middle of the forwarded context:
@@ -214,6 +216,12 @@ sender's privacy settings. Agentgram shows the user who forwarded the message to
 the bot and, when Telegram provides it, the original user, hidden-user name,
 source chat, or source channel. Hidden or uncertain authorship is marked in the
 transcript.
+
+Forwarded inbox records are ordered by the original message timestamp from
+Telegram's `forward_origin.date` when available, with bot receive order as the
+tie-breaker. Human-readable output shows the original group timestamp first.
+Structured JSON/JSONL output also includes the forwarded-copy bot timestamp as
+`date_iso` and the original timestamp as `original_date_iso`.
 
 `getUpdates` cannot be used while the same bot has an outgoing webhook set.
 Remove the webhook or use a bot token dedicated to Agentgram inbox reads.

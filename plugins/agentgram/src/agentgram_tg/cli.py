@@ -582,10 +582,11 @@ def inbox_records(
     since_seconds: int,
     include_plain: bool,
     now: int,
+    received_index_start: int = 1,
 ) -> list[dict[str, Any]]:
     threshold = now - since_seconds
     records: list[dict[str, Any]] = []
-    for update in updates:
+    for received_index, update in enumerate(updates, start=received_index_start):
         message = update.get("message")
         if not isinstance(message, dict):
             continue
@@ -599,12 +600,16 @@ def inbox_records(
         forwarded = isinstance(forward_origin, dict)
         if not forwarded and not include_plain:
             continue
+        original_date = original_message_date(forward_origin)
         records.append(
             {
                 "update_id": update.get("update_id"),
                 "message_id": message.get("message_id"),
+                "received_index": received_index,
                 "date": message_date,
                 "date_iso": iso_utc(message_date),
+                "original_date": original_date,
+                "original_date_iso": iso_utc(original_date) if original_date is not None else None,
                 "chat": render_chat(chat),
                 "forwarded": forwarded,
                 "forwarded_by": render_user(message.get("from")),
@@ -613,7 +618,29 @@ def inbox_records(
                 "attachments": extract_message_attachments(message),
             }
         )
-    return sorted(records, key=lambda item: (item["date"], item.get("update_id") or 0, item.get("message_id") or 0))
+    return sort_inbox_records(records)
+
+
+def sort_inbox_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(records, key=inbox_record_sort_key)
+
+
+def original_message_date(forward_origin: Any) -> int | None:
+    if not isinstance(forward_origin, dict):
+        return None
+    date = forward_origin.get("date")
+    if isinstance(date, int) and not isinstance(date, bool):
+        return date
+    return None
+
+
+def inbox_record_sort_key(record: dict[str, Any]) -> tuple[int, int, int]:
+    original_date = record.get("original_date")
+    if isinstance(original_date, int) and not isinstance(original_date, bool):
+        timestamp = original_date
+    else:
+        timestamp = int(record.get("date") or 0)
+    return (timestamp, int(record.get("received_index") or 0), int(record.get("update_id") or 0))
 
 
 def render_inbox_markdown(records: list[dict[str, Any]]) -> str:
@@ -625,10 +652,11 @@ def render_inbox_markdown(records: list[dict[str, Any]]) -> str:
         sections.append(
             "\n".join(
                 [
-                    f"## {record['date_iso']} | {origin['label']}",
+                    f"## {inbox_display_date_iso(record)} | {origin['label']}",
                     f"- Chat: {record['chat']['label']}",
                     f"- Forwarded by: {record['forwarded_by']['label']}",
                     f"- Original source: {origin['source']}",
+                    *render_timestamp_markdown_lines(record),
                     *render_attachment_markdown_lines(record.get("attachments")),
                     "",
                     record["content"],
@@ -648,8 +676,25 @@ def render_inbox_compact(records: list[dict[str, Any]], *, start_index: int = 1)
         attachments = compact_attachment_summary(record.get("attachments"))
         if attachments:
             content = f"{content} | attachments: {attachments}"
-        lines.append(f"{index}. [{record['date_iso']}] {speaker}: {content}")
+        lines.append(f"{index}. [{inbox_display_date_iso(record)}] {speaker}: {content}")
     return "\n".join(lines)
+
+
+def inbox_display_date_iso(record: dict[str, Any]) -> str:
+    original_date_iso = record.get("original_date_iso")
+    if isinstance(original_date_iso, str) and original_date_iso:
+        return original_date_iso
+    return str(record["date_iso"])
+
+
+def render_timestamp_markdown_lines(record: dict[str, Any]) -> list[str]:
+    original_date_iso = record.get("original_date_iso")
+    if not isinstance(original_date_iso, str) or not original_date_iso:
+        return []
+    return [
+        f"- Original sent at: {original_date_iso}",
+        f"- Forwarded received at: {record['date_iso']}",
+    ]
 
 
 def render_attachment_markdown_lines(attachments: Any) -> list[str]:
@@ -781,6 +826,72 @@ class InboxOutput:
         print(f"path={self.path}", file=self.stdout)
         print(f"read chunks: sed -n '1,120p' {quoted_path}", file=self.stdout)
         print(f"delete after import: rm -- {quoted_path}", file=self.stdout)
+
+
+class InboxRecordStage:
+    def __init__(self, *, directory: Path | None = None) -> None:
+        fd, path = tempfile.mkstemp(
+            prefix="agentgram-inbox-stage-",
+            suffix=".jsonl",
+            dir=str(directory) if directory is not None else None,
+        )
+        self.path = Path(path)
+        self.handle = os.fdopen(fd, "w", encoding="utf-8")
+
+    def append_records(self, records: list[dict[str, Any]]) -> None:
+        rendered = render_inbox_jsonl(records)
+        if not rendered:
+            return
+        self.handle.write(f"{rendered}\n")
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+
+    def read_records(self) -> list[dict[str, Any]]:
+        self.handle.flush()
+        records: list[dict[str, Any]] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    def close(self) -> None:
+        if not self.handle.closed:
+            self.handle.close()
+
+    def cleanup(self) -> None:
+        self.close()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_staged_records_to_output(stage: InboxRecordStage, output: InboxOutput) -> None:
+    output.write_records(sort_inbox_records(stage.read_records()))
+    stage.cleanup()
+
+
+def raise_with_retained_stage(
+    exc: Exception,
+    stage: InboxRecordStage,
+    *,
+    flush_exc: Exception | None = None,
+) -> None:
+    stage.close()
+    if flush_exc is None:
+        message = f"{exc}; staged inbox records kept at {stage.path}"
+    else:
+        message = (
+            f"{exc}; additionally failed to render staged inbox records: {flush_exc}; "
+            f"staged inbox records kept at {stage.path}"
+        )
+    if isinstance(exc, CliError):
+        raise CliError(message) from exc
+    if isinstance(exc, TelegramError):
+        raise TelegramError(message) from exc
+    raise RuntimeError(message) from exc
 
 
 class InboxDownloader:
@@ -981,6 +1092,17 @@ def read_acknowledged_inbox(
     downloader: InboxDownloader | None,
     now: int,
 ) -> int:
+    if limit > TELEGRAM_UPDATE_LIMIT:
+        return read_acknowledged_inbox_buffered(
+            client,
+            chat_id=chat_id,
+            limit=limit,
+            since_seconds=since_seconds,
+            include_plain=include_plain,
+            output=output,
+            downloader=downloader,
+            now=now,
+        )
     remaining = limit
     wrote_output = False
     while remaining > 0:
@@ -1010,6 +1132,71 @@ def read_acknowledged_inbox(
         remaining -= len(updates)
         if len(updates) < batch_limit:
             break
+    return 0
+
+
+def read_acknowledged_inbox_buffered(
+    client: TelegramClient,
+    *,
+    chat_id: str,
+    limit: int,
+    since_seconds: int,
+    include_plain: bool,
+    output: InboxOutput,
+    downloader: InboxDownloader | None,
+    now: int,
+) -> int:
+    remaining = limit
+    received_index_start = 1
+    stage: InboxRecordStage | None = None
+    final_output_started = False
+    try:
+        while remaining > 0:
+            batch_limit = min(TELEGRAM_UPDATE_LIMIT, remaining)
+            updates = client.get_updates(batch_limit, timeout=0, allowed_updates=["message"])
+            if not updates:
+                break
+            output.note_updates(updates)
+            records = inbox_records(
+                updates,
+                chat_id=chat_id,
+                since_seconds=since_seconds,
+                include_plain=include_plain,
+                now=now,
+                received_index_start=received_index_start,
+            )
+            received_index_start += len(updates)
+            if not records:
+                break
+            if downloader is not None:
+                downloader.download_records(client, records)
+            if stage is None:
+                stage = InboxRecordStage(directory=output.path.parent if output.path is not None else None)
+            stage.append_records(records)
+            acknowledge_inbox_records(client, updates, records)
+            remaining -= len(updates)
+            if len(updates) < batch_limit:
+                break
+        staged_records = [] if stage is None else stage.read_records()
+        final_output_started = True
+        output.write_records(sort_inbox_records(staged_records))
+        if stage is not None:
+            stage.cleanup()
+            stage = None
+    except Exception as exc:
+        if stage is not None:
+            if not final_output_started:
+                try:
+                    write_staged_records_to_output(stage, output)
+                except Exception as flush_exc:
+                    raise_with_retained_stage(exc, stage, flush_exc=flush_exc)
+                stage = None
+                raise
+            raise_with_retained_stage(exc, stage)
+        raise
+    finally:
+        if stage is not None:
+            stage.close()
     return 0
 
 
