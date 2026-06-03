@@ -257,10 +257,216 @@ class CliPayloadTests(unittest.TestCase):
         )
 
 
+class InboxTests(unittest.TestCase):
+    def test_inbox_help_lists_options(self) -> None:
+        inbox_parser = cli.build_parser()._subparsers._group_actions[0].choices["inbox"]
+        output = inbox_parser.format_help()
+
+        for option in (
+            "--chat-id",
+            "--limit",
+            "--since",
+            "--forwarded-only",
+            "--include-plain",
+            "--format",
+            "markdown",
+            "json",
+        ):
+            self.assertIn(option, output)
+
+    def test_parse_duration_accepts_minutes_hours_and_days(self) -> None:
+        self.assertEqual(cli.parse_duration("15m"), 900)
+        self.assertEqual(cli.parse_duration("3h"), 10800)
+        self.assertEqual(cli.parse_duration("1d"), 86400)
+
+    def test_parse_duration_rejects_invalid_value(self) -> None:
+        with self.assertRaisesRegex(cli.CliError, "since must be a duration"):
+            cli.parse_duration("three hours")
+
+    def test_default_inbox_fetches_forwarded_messages_as_markdown(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(3, 30, 1_700_000_030, text="newest", origin=self.origin_hidden_user("Hidden Ada")),
+                self.update(1, 10, 1_700_000_010, text="oldest", origin=self.origin_user("Grace")),
+                self.update(2, 20, 1_700_000_020, text="plain", origin=None),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_040):
+                code = cli.run(
+                    ["inbox"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        client_cls.return_value.get_updates.assert_called_once_with(
+            100,
+            timeout=0,
+            allowed_updates=["message"],
+        )
+        output = stdout.getvalue()
+        self.assertIn("# Agentgram Inbox", output)
+        self.assertLess(output.find("oldest"), output.find("newest"))
+        self.assertIn("Original source: Grace", output)
+        self.assertIn("Hidden Ada (privacy-hidden user)", output)
+        self.assertNotIn("plain", output)
+
+    def test_inbox_uses_chat_id_override(self) -> None:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(1, 10, 1_700_000_000, chat_id=123, text="included", origin=self.origin_user("Ada")),
+                self.update(2, 20, 1_700_000_000, chat_id=99, text="excluded", origin=self.origin_user("Grace")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                stdout = io.StringIO()
+                code = cli.run(
+                    ["inbox", "--chat-id", "123"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("included", stdout.getvalue())
+        self.assertNotIn("excluded", stdout.getvalue())
+
+    def test_include_plain_includes_direct_messages(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(1, 10, 1_700_000_000, text="plain note", origin=None),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--include-plain"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("direct message to bot", stdout.getvalue())
+        self.assertIn("plain note", stdout.getvalue())
+
+    def test_since_filters_old_messages(self) -> None:
+        updates = [
+            self.update(1, 10, 1_700_000_000, text="too old", origin=self.origin_user("Ada")),
+            self.update(2, 20, 1_700_000_090, text="recent", origin=self.origin_user("Ada")),
+        ]
+
+        records = cli.inbox_records(
+            updates,
+            chat_id="99",
+            since_seconds=60,
+            include_plain=False,
+            now=1_700_000_100,
+        )
+
+        self.assertEqual([record["content"] for record in records], ["recent"])
+
+    def test_json_output_emits_stable_records(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(1, 10, 1_700_000_000, text="hello", origin=self.origin_user("Ada", username="ada")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--format", "json"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["content"], "hello")
+        self.assertEqual(payload[0]["origin"]["type"], "user")
+        self.assertEqual(payload[0]["origin"]["source"], "Ada (@ada)")
+        self.assertEqual(payload[0]["date_iso"], "2023-11-14T22:13:20Z")
+
+    def test_forward_origin_rendering_covers_chat_and_channel(self) -> None:
+        chat = cli.render_forward_origin(
+            {
+                "type": "chat",
+                "sender_chat": {"id": -10, "type": "supergroup", "title": "Ops"},
+                "author_signature": "Moderator",
+            }
+        )
+        channel = cli.render_forward_origin(
+            {
+                "type": "channel",
+                "chat": {"id": -100, "type": "channel", "title": "Deploys"},
+                "message_id": 777,
+                "author_signature": "Release Bot",
+            }
+        )
+
+        self.assertEqual(chat["type"], "chat")
+        self.assertIn("Ops", chat["source"])
+        self.assertIn("signature: Moderator", chat["source"])
+        self.assertEqual(channel["type"], "channel")
+        self.assertIn("Deploys", channel["source"])
+        self.assertIn("original message_id: 777", channel["source"])
+        self.assertIn("signature: Release Bot", channel["source"])
+
+    def test_extract_message_content_uses_caption_and_media_summary(self) -> None:
+        self.assertEqual(cli.extract_message_content({"caption": "image caption"}), "image caption")
+        self.assertEqual(
+            cli.extract_message_content({"document": {"file_name": "report.pdf", "mime_type": "application/pdf"}}),
+            "[document: report.pdf]",
+        )
+        self.assertEqual(cli.extract_message_content({"photo": [{}, {}]}), "[photo: 2 sizes]")
+        self.assertEqual(cli.extract_message_content({}), "[message without text]")
+
+    def update(
+        self,
+        update_id: int,
+        message_id: int,
+        date: int,
+        *,
+        chat_id: int = 99,
+        text: str,
+        origin: dict[str, object] | None,
+    ) -> dict[str, object]:
+        message: dict[str, object] = {
+            "message_id": message_id,
+            "date": date,
+            "chat": {"id": chat_id, "type": "private", "first_name": "User"},
+            "from": {"id": 555, "first_name": "Forwarder", "username": "forwarder"},
+            "text": text,
+        }
+        if origin is not None:
+            message["forward_origin"] = origin
+        return {"update_id": update_id, "message": message}
+
+    def origin_user(self, name: str, *, username: str = "") -> dict[str, object]:
+        user: dict[str, object] = {"id": 123, "first_name": name}
+        if username:
+            user["username"] = username
+        return {"type": "user", "date": 1_700_000_000, "sender_user": user}
+
+    def origin_hidden_user(self, name: str) -> dict[str, object]:
+        return {"type": "hidden_user", "date": 1_700_000_000, "sender_user_name": name}
+
+
 class CliRunTests(unittest.TestCase):
     def test_help_lists_public_commands(self) -> None:
         output = cli.build_parser().format_help()
-        for command in ("send", "send-file", "chat-id", "doctor", "update"):
+        for command in ("send", "send-file", "chat-id", "inbox", "doctor", "update"):
             self.assertIn(command, output)
 
     def test_send_requires_token_without_leaking(self) -> None:
