@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Iterable, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
@@ -90,6 +93,26 @@ def build_parser() -> argparse.ArgumentParser:
     chat_id = subcommands.add_parser("chat-id", help="show candidate chat ids from recent updates")
     chat_id.add_argument("--raw", action="store_true", help="print raw getUpdates JSON")
     chat_id.set_defaults(func=cmd_chat_id)
+
+    inbox = subcommands.add_parser("inbox", help="read recent messages forwarded to the bot")
+    inbox.add_argument("--chat-id", help=f"override {CHAT_ID_ENV}")
+    inbox.add_argument("--limit", type=int, default=100, help="maximum pending updates to read, from 1 to 100")
+    inbox.add_argument("--since", default="24h", help="only include messages newer than this duration, e.g. 15m, 3h, 1d")
+    inbox_filter = inbox.add_mutually_exclusive_group()
+    inbox_filter.add_argument(
+        "--forwarded-only",
+        action="store_false",
+        dest="include_plain",
+        help="only include forwarded messages; this is the default",
+    )
+    inbox_filter.add_argument(
+        "--include-plain",
+        action="store_true",
+        dest="include_plain",
+        help="also include direct non-forwarded messages sent to the bot",
+    )
+    inbox.set_defaults(func=cmd_inbox, include_plain=False, output_format="markdown")
+    inbox.add_argument("--format", choices=("markdown", "json"), default="markdown", dest="output_format")
 
     doctor = subcommands.add_parser("doctor", help="check Agentgram and Telegram configuration")
     doctor.add_argument("--json", action="store_true", dest="json_output", help="print JSON")
@@ -236,6 +259,30 @@ def cmd_chat_id(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, 
     for candidate in candidates:
         title = candidate.get("title") or candidate.get("username") or candidate.get("name") or "(untitled)"
         print(f"{candidate['id']}\t{candidate['type']}\t{title}", file=stdout)
+    return 0
+
+
+def cmd_inbox(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, str]) -> int:
+    token = require_env(environ, TOKEN_ENV)
+    chat_id = args.chat_id or require_env(environ, CHAT_ID_ENV)
+    limit = validate_inbox_limit(args.limit)
+    since_seconds = parse_duration(args.since)
+    updates = TelegramClient(token).get_updates(
+        limit,
+        timeout=0,
+        allowed_updates=["message"],
+    )
+    records = inbox_records(
+        updates,
+        chat_id=chat_id,
+        since_seconds=since_seconds,
+        include_plain=args.include_plain,
+        now=int(time.time()),
+    )
+    if args.output_format == "json":
+        print(json.dumps(records, indent=2, sort_keys=True), file=stdout)
+    else:
+        print(render_inbox_markdown(records), file=stdout)
     return 0
 
 
@@ -403,6 +450,218 @@ def validate_text_filename(filename: str | None) -> str:
     if "/" in name or "\\" in name or Path(name).name != name or name in (".", ".."):
         raise CliError("filename must be a file name, not a path")
     return name
+
+
+def validate_inbox_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 100:
+        raise CliError("limit must be from 1 to 100")
+    return value
+
+
+def parse_duration(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", value)
+    if not match:
+        raise CliError("since must be a duration like 15m, 3h, or 1d")
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise CliError("since duration must be greater than zero")
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return amount * multipliers[match.group(2)]
+
+
+def inbox_records(
+    updates: list[dict[str, Any]],
+    *,
+    chat_id: str,
+    since_seconds: int,
+    include_plain: bool,
+    now: int,
+) -> list[dict[str, Any]]:
+    threshold = now - since_seconds
+    records: list[dict[str, Any]] = []
+    for update in updates:
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or str(chat.get("id")) != str(chat_id):
+            continue
+        message_date = message.get("date")
+        if not isinstance(message_date, int) or message_date < threshold:
+            continue
+        forward_origin = message.get("forward_origin")
+        forwarded = isinstance(forward_origin, dict)
+        if not forwarded and not include_plain:
+            continue
+        records.append(
+            {
+                "update_id": update.get("update_id"),
+                "message_id": message.get("message_id"),
+                "date": message_date,
+                "date_iso": iso_utc(message_date),
+                "chat": render_chat(chat),
+                "forwarded": forwarded,
+                "forwarded_by": render_user(message.get("from")),
+                "origin": render_forward_origin(forward_origin) if forwarded else plain_origin(),
+                "content": extract_message_content(message),
+            }
+        )
+    return sorted(records, key=lambda item: (item["date"], item.get("update_id") or 0, item.get("message_id") or 0))
+
+
+def render_inbox_markdown(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return "No inbox messages found."
+    sections: list[str] = ["# Agentgram Inbox"]
+    for record in records:
+        origin = record["origin"]
+        sections.append(
+            "\n".join(
+                [
+                    f"## {record['date_iso']} | {origin['label']}",
+                    f"- Chat: {record['chat']['label']}",
+                    f"- Forwarded by: {record['forwarded_by']['label']}",
+                    f"- Original source: {origin['source']}",
+                    "",
+                    record["content"],
+                ]
+            )
+        )
+    return "\n\n".join(sections)
+
+
+def extract_message_content(message: dict[str, Any]) -> str:
+    for field in ("text", "caption"):
+        value = message.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    media_checks: list[tuple[str, str]] = [
+        ("photo", "photo"),
+        ("video", "video"),
+        ("animation", "animation"),
+        ("audio", "audio"),
+        ("voice", "voice message"),
+        ("video_note", "video note"),
+        ("sticker", "sticker"),
+        ("document", "document"),
+        ("contact", "contact"),
+        ("location", "location"),
+        ("venue", "venue"),
+        ("poll", "poll"),
+        ("dice", "dice"),
+    ]
+    for key, label in media_checks:
+        value = message.get(key)
+        if value is None:
+            continue
+        details = media_details(key, value)
+        return f"[{label}{': ' + details if details else ''}]"
+    return "[message without text]"
+
+
+def media_details(kind: str, value: Any) -> str:
+    if kind == "photo" and isinstance(value, list):
+        return f"{len(value)} sizes"
+    if isinstance(value, dict):
+        if kind == "document":
+            return first_text(value, "file_name", "mime_type")
+        if kind in {"video", "animation", "audio"}:
+            return first_text(value, "file_name", "title", "mime_type")
+        if kind == "sticker":
+            return first_text(value, "emoji", "set_name")
+        if kind == "contact":
+            return first_text(value, "first_name", "phone_number")
+        if kind == "venue":
+            return first_text(value, "title", "address")
+        if kind == "poll":
+            return first_text(value, "question")
+        if kind == "dice":
+            return first_text(value, "emoji")
+    return ""
+
+
+def first_text(mapping: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def render_forward_origin(origin: Any) -> dict[str, Any]:
+    if not isinstance(origin, dict):
+        return plain_origin()
+    origin_type = str(origin.get("type") or "unknown")
+    if origin_type == "user":
+        user = render_user(origin.get("sender_user"))
+        source = user["label"] if user["known"] else "known user (details unavailable)"
+    elif origin_type == "hidden_user":
+        name = str(origin.get("sender_user_name") or "unknown user")
+        source = f"{name} (privacy-hidden user)"
+    elif origin_type == "chat":
+        chat = render_chat(origin.get("sender_chat"))
+        source = chat["label"]
+        signature = origin.get("author_signature")
+        if signature:
+            source = f"{source}; signature: {signature}"
+    elif origin_type == "channel":
+        chat = render_chat(origin.get("chat"))
+        source = chat["label"]
+        message_id = origin.get("message_id")
+        if message_id is not None:
+            source = f"{source}; original message_id: {message_id}"
+        signature = origin.get("author_signature")
+        if signature:
+            source = f"{source}; signature: {signature}"
+    else:
+        source = "unknown forwarded source"
+    return {"type": origin_type, "label": "forwarded", "source": source}
+
+
+def plain_origin() -> dict[str, str]:
+    return {"type": "plain", "label": "direct", "source": "direct message to bot"}
+
+
+def render_user(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"id": None, "username": "", "name": "", "label": "unknown user", "known": False}
+    name = " ".join(str(part) for part in (value.get("first_name"), value.get("last_name")) if part)
+    username = str(value.get("username") or "")
+    label = name or (f"@{username}" if username else "unknown user")
+    if username and name:
+        label = f"{name} (@{username})"
+    return {
+        "id": value.get("id"),
+        "username": username,
+        "name": name,
+        "label": label,
+        "known": label != "unknown user",
+    }
+
+
+def render_chat(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"id": None, "type": "unknown", "title": "", "username": "", "label": "unknown chat"}
+    title = str(
+        value.get("title")
+        or " ".join(str(part) for part in (value.get("first_name"), value.get("last_name")) if part)
+        or ""
+    )
+    username = str(value.get("username") or "")
+    label = title or (f"@{username}" if username else str(value.get("id") or "unknown chat"))
+    if username and title:
+        label = f"{title} (@{username})"
+    return {
+        "id": value.get("id"),
+        "type": str(value.get("type") or "unknown"),
+        "title": title,
+        "username": username,
+        "label": label,
+    }
+
+
+def iso_utc(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def split_message_text(text: str, *, limit: int = MAX_TEXT_LENGTH) -> list[str]:
