@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 from pathlib import Path
@@ -268,6 +269,8 @@ class InboxTests(unittest.TestCase):
             "--since",
             "--forwarded-only",
             "--include-plain",
+            "--peek",
+            "--ack",
             "--format",
             "markdown",
             "json",
@@ -431,6 +434,140 @@ class InboxTests(unittest.TestCase):
         )
         self.assertEqual(cli.extract_message_content({"photo": [{}, {}]}), "[photo: 2 sizes]")
         self.assertEqual(cli.extract_message_content({}), "[message without text]")
+
+    def test_inbox_peek_is_default_and_does_not_acknowledge(self) -> None:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(7, 10, 1_700_000_000, text="peeked", origin=self.origin_user("Ada")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox"],
+                    stdout=io.StringIO(),
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_inbox_ack_consumes_after_successful_output(self) -> None:
+        events: list[str] = []
+        updates = [self.update(7, 10, 1_700_000_000, text="ack me", origin=self.origin_user("Ada"))]
+
+        def get_updates(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            events.append("ack" if "offset" in kwargs else "fetch")
+            return updates if "offset" not in kwargs else []
+
+        class RecordingStdout(io.StringIO):
+            def write(self, value: str) -> int:
+                if value and (not events or events[-1] != "write"):
+                    events.append("write")
+                return super().write(value)
+
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.side_effect = get_updates
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--ack"],
+                    stdout=RecordingStdout(),
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["fetch", "write", "ack"])
+        client_cls.return_value.get_updates.assert_has_calls(
+            [
+                mock.call(100, timeout=0, allowed_updates=["message"]),
+                mock.call(1, offset=8, timeout=0, allowed_updates=["message"]),
+            ]
+        )
+
+    def test_inbox_ack_does_not_consume_empty_output(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = []
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--ack"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue().strip(), "No inbox messages found.")
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_inbox_ack_does_not_consume_when_rendering_fails(self) -> None:
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(7, 10, 1_700_000_000, text="do not ack", origin=self.origin_user("Ada")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                with mock.patch("agentgram_tg.cli.render_inbox_markdown", side_effect=RuntimeError("render failed")):
+                    with self.assertRaisesRegex(RuntimeError, "render failed"):
+                        cli.cmd_inbox(
+                            argparse.Namespace(
+                                chat_id=None,
+                                limit=100,
+                                since="24h",
+                                include_plain=False,
+                                output_format="markdown",
+                                ack=True,
+                            ),
+                            stdout=io.StringIO(),
+                            environ={
+                                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                                "TELEGRAM_CHAT_ID": "99",
+                            },
+                        )
+
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_inbox_ack_refuses_to_skip_filtered_updates(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        updates = [
+            self.update(7, 10, 1_700_000_000, text="plain before", origin=None),
+            self.update(8, 20, 1_700_000_000, text="forwarded after", origin=self.origin_user("Ada")),
+        ]
+
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = updates
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--ack"],
+                    stdout=stdout,
+                    stderr=stderr,
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("forwarded after", stdout.getvalue())
+        self.assertIn("were not rendered", stderr.getvalue())
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_acknowledge_inbox_records_never_uses_negative_offset(self) -> None:
+        client = mock.Mock()
+
+        with self.assertRaisesRegex(cli.CliError, "negative offset"):
+            cli.acknowledge_inbox_records(client, [{"update_id": -2}], [{"update_id": -2}])
+
+        client.get_updates.assert_not_called()
 
     def update(
         self,
