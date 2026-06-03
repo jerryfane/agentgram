@@ -28,9 +28,14 @@ agentgram send --as-file --filename report.md "long message text"
 agentgram send-file ./report.md --caption "Report"
 agentgram inbox
 agentgram inbox --limit 100
+agentgram inbox --limit 500 --ack
 agentgram inbox --since 3h
 agentgram inbox --include-plain
+agentgram inbox --format compact --output /tmp
+agentgram inbox --format jsonl --output /tmp
 agentgram inbox --ack
+agentgram inbox --include-plain --download-files --download-dir /tmp --ack
+agentgram download-file <file_id> --output /tmp
 agentgram chat-id
 agentgram doctor
 agentgram update
@@ -100,14 +105,25 @@ they forwarded to the Agentgram bot, such as "read the recent messages I
 forwarded to you" or "import the Telegram context I just forwarded".
 
 Use `$AGENTGRAM_CMD inbox --limit 100` when the user asks for the last 100
-pending forwarded messages. Use `$AGENTGRAM_CMD inbox --since 3h` when the user
-asks for messages from the last 3 hours. Use `$AGENTGRAM_CMD inbox
---include-plain` when the user says they also sent direct notes to the bot, or
-that the forwarded context is mixed with direct messages.
+pending forwarded messages without consuming them. Peek reads support at most
+100 pending updates. Use `$AGENTGRAM_CMD inbox --limit 370 --ack --format
+compact --output /tmp` when the user asks to read and consume a larger
+forwarded batch, such as "the last 370 messages"; acknowledged reads support up
+to 500 pending updates and read Telegram in 100-update batches. Use
+`$AGENTGRAM_CMD inbox --since 3h` when the user asks for messages from the last
+3 hours. Use `$AGENTGRAM_CMD inbox --include-plain` when the user says they
+also sent direct notes to the bot, or that the forwarded context is mixed with
+direct messages.
 
 The default inbox mode is `--peek`, which reads without consuming Telegram
 updates. Use `$AGENTGRAM_CMD inbox --ack` only after a successful import, or
 when the user explicitly asks to consume or clear the forwarded messages.
+For large inbox imports, prefer `--format compact --output /tmp` so Codex can
+read the generated private file in chunks and avoid terminal-output truncation.
+Read the generated path with commands such as `sed -n '1,120p' <path>`, then
+delete only that exact generated file with `rm -- <path>` after importing the
+context. Use `--format json` only for single-batch inbox reads up to 100
+updates; use `--format jsonl` for structured multi-batch output.
 
 Inbox uses Telegram Bot API pending updates only. It is not full Telegram chat
 history and does not use an MTProto user session. Pending updates can expire,
@@ -117,9 +133,29 @@ webhook conflict, tell the user to remove the webhook or use a separate bot
 token for Agentgram inbox reads.
 
 Agentgram does not write message content, captions, sender names, raw updates,
-or transcripts to local files. Forwarded authorship depends on Telegram
-`forward_origin` metadata and sender privacy settings; hidden or uncertain
-authors are marked in the output.
+or transcripts to local files unless the user or agent explicitly passes
+`--output PATH`. Forwarded authorship depends on Telegram `forward_origin`
+metadata and sender privacy settings; hidden or uncertain authors are marked in
+the output.
+
+Use `$AGENTGRAM_CMD inbox --include-plain --download-files --download-dir /tmp
+--ack` when the user asks to download or inspect a file they sent or forwarded
+to the Agentgram bot. The file must be sent or forwarded to the bot chat; files
+sent only to the user's personal saved messages are not visible to the bot.
+If multiple files are present, list the downloaded paths or attachment names and
+ask which one to inspect unless the user's request identifies the file clearly.
+
+Use `$AGENTGRAM_CMD download-file <file_id> --output /tmp` only when you already
+have a concrete `file_id` from `agentgram inbox --format json` or `--format
+jsonl`. Prefer `inbox --download-files` for normal user requests because agents
+usually do not know the `file_id` ahead of time.
+
+Downloaded files are written locally with private permissions and no overwrite,
+and Agentgram prints path, byte count, SHA-256 digest, read hints, and delete
+hints. Do not print or reconstruct Telegram file download URLs because they
+contain the bot token. Public Telegram Bot API downloads through `getFile` are
+limited to 20 MB; for larger files, tell the user that Agentgram would need a
+future local Bot API server setup or another transfer path.
 
 ## Update Workflow
 

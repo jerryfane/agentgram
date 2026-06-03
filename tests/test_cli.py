@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -272,8 +273,14 @@ class InboxTests(unittest.TestCase):
             "--peek",
             "--ack",
             "--format",
+            "--output",
+            "--download-files",
+            "--download-dir",
+            "--max-file-bytes",
             "markdown",
+            "compact",
             "json",
+            "jsonl",
         ):
             self.assertIn(option, output)
 
@@ -401,6 +408,122 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(payload[0]["origin"]["source"], "Ada (@ada)")
         self.assertEqual(payload[0]["date_iso"], "2023-11-14T22:13:20Z")
 
+    def test_compact_output_emits_line_oriented_context(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(
+                    1,
+                    10,
+                    1_700_000_000,
+                    text="hello\n\nworld",
+                    origin=self.origin_user("Ada", username="ada"),
+                ),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--format", "compact"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stdout.getvalue().strip(),
+            "1. [2023-11-14T22:13:20Z] Ada (@ada): hello world",
+        )
+
+    def test_compact_output_includes_downloaded_attachment_context(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.return_value = [
+                    self.update(
+                        1,
+                        10,
+                        1_700_000_000,
+                        text="",
+                        origin=self.origin_user("Ada", username="ada"),
+                        media={
+                            "caption": "caption text",
+                            "document": {"file_id": "secret-file-id", "file_name": "report.txt", "file_size": 5},
+                        },
+                    ),
+                ]
+                client.get_file.return_value = {
+                    "file_id": "secret-file-id",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.return_value = {
+                    "path": str(target),
+                    "bytes": 5,
+                    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                }
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp, "--format", "compact"],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn(f"caption text | attachments: document report.txt 5 bytes -> {target}", output)
+        self.assertNotIn("secret-file-id", output)
+
+    def test_jsonl_output_emits_one_record_per_line(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(1, 10, 1_700_000_000, text="first", origin=self.origin_user("Ada")),
+                self.update(2, 20, 1_700_000_001, text="second", origin=self.origin_user("Grace")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_002):
+                code = cli.run(
+                    ["inbox", "--format", "jsonl"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        lines = stdout.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["content"], "first")
+        self.assertEqual(json.loads(lines[1])["content"], "second")
+
+    def test_jsonl_empty_output_emits_no_blank_stdout_line(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = []
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_002):
+                code = cli.run(
+                    ["inbox", "--format", "jsonl"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_forward_origin_rendering_covers_chat_and_channel(self) -> None:
         chat = cli.render_forward_origin(
             {
@@ -435,6 +558,370 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(cli.extract_message_content({"photo": [{}, {}]}), "[photo: 2 sizes]")
         self.assertEqual(cli.extract_message_content({}), "[message without text]")
 
+    def test_inbox_json_includes_document_attachment_metadata(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(
+                    1,
+                    10,
+                    1_700_000_000,
+                    text="",
+                    origin=self.origin_user("Ada"),
+                    media={
+                        "document": {
+                            "file_id": "doc-file-id",
+                            "file_unique_id": "doc-unique",
+                            "file_name": "report.pdf",
+                            "mime_type": "application/pdf",
+                            "file_size": 123,
+                        },
+                        "caption": "quarterly report",
+                    },
+                ),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--format", "json"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        attachment = payload[0]["attachments"][0]
+        self.assertEqual(attachment["kind"], "document")
+        self.assertEqual(attachment["file_id"], "doc-file-id")
+        self.assertEqual(attachment["file_name"], "report.pdf")
+        self.assertEqual(attachment["file_name_source"], "telegram")
+        self.assertEqual(attachment["mime_type"], "application/pdf")
+        self.assertEqual(attachment["file_size"], 123)
+        self.assertEqual(attachment["caption"], "quarterly report")
+
+    def test_extract_message_attachments_covers_supported_media(self) -> None:
+        message = {
+            "message_id": 42,
+            "caption": "media batch",
+            "document": {"file_id": "document-id", "file_unique_id": "document-u", "file_name": "doc.txt"},
+            "audio": {"file_id": "audio-id", "file_unique_id": "audio-u", "title": "song"},
+            "video": {"file_id": "video-id", "file_unique_id": "video-u", "mime_type": "video/mp4"},
+            "animation": {"file_id": "animation-id", "file_unique_id": "animation-u"},
+            "voice": {"file_id": "voice-id", "file_unique_id": "voice-u"},
+            "video_note": {"file_id": "video-note-id", "file_unique_id": "video-note-u"},
+            "photo": [
+                {"file_id": "small-photo-id", "file_unique_id": "small-photo-u", "width": 10, "height": 10},
+                {
+                    "file_id": "large-photo-id",
+                    "file_unique_id": "large-photo-u",
+                    "width": 100,
+                    "height": 100,
+                    "file_size": 200,
+                },
+            ],
+        }
+
+        attachments = cli.extract_message_attachments(message)
+
+        self.assertEqual(
+            [attachment["kind"] for attachment in attachments],
+            ["document", "audio", "video", "animation", "voice", "video_note", "photo"],
+        )
+        self.assertEqual(attachments[-1]["file_id"], "large-photo-id")
+        self.assertTrue(attachments[2]["file_name"].endswith(".mp4"))
+        self.assertEqual({attachment["caption"] for attachment in attachments}, {"media batch"})
+
+    def test_telegram_metadata_filename_slashes_are_sanitized_for_inbox(self) -> None:
+        attachments = cli.extract_message_attachments(
+            {
+                "message_id": 42,
+                "audio": {"file_id": "audio-id", "file_unique_id": "audio-u", "title": "AC/DC"},
+                "document": {"file_id": "doc-id", "file_unique_id": "doc-u", "file_name": "../report.txt"},
+            }
+        )
+
+        by_kind = {attachment["kind"]: attachment for attachment in attachments}
+        self.assertEqual(by_kind["audio"]["file_name"], "AC_DC")
+        self.assertEqual(by_kind["document"]["file_name"], "_report.txt")
+
+    def test_inbox_markdown_hides_raw_file_ids_without_downloads(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(
+                    1,
+                    10,
+                    1_700_000_000,
+                    text="",
+                    origin=self.origin_user("Ada"),
+                    media={"document": {"file_id": "secret-file-id", "file_name": "report.pdf", "file_size": 12}},
+                ),
+                self.update(
+                    2,
+                    11,
+                    1_700_000_000,
+                    text="",
+                    origin=self.origin_user("Ada"),
+                    media={"photo": [{"file_id": "raw-photo-file-id", "width": 100, "height": 100}]},
+                ),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn("document report.pdf 12 bytes", output)
+        self.assertNotIn("secret-file-id", output)
+        self.assertNotIn("raw-photo-file-id", output)
+        self.assertIn("photo-11-id-", output)
+
+    def test_inbox_download_files_acknowledges_only_after_download(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.side_effect = [
+                    [
+                        self.update(
+                            1,
+                            10,
+                            1_700_000_000,
+                            text="",
+                            origin=None,
+                            media={
+                                "document": {
+                                    "file_id": "doc-file-id",
+                                    "file_unique_id": "doc-u",
+                                    "file_name": "report.txt",
+                                    "file_size": 5,
+                                }
+                            },
+                        )
+                    ],
+                    [],
+                ]
+                client.get_file.return_value = {
+                    "file_id": "doc-file-id",
+                    "file_unique_id": "doc-u",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.return_value = {
+                    "path": str(Path(tmp) / "report.txt"),
+                    "bytes": 5,
+                    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                }
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp, "--ack"],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(client.get_updates.call_args_list[-1].kwargs["offset"], 2)
+        self.assertLess(
+            client.method_calls.index(mock.call.download_file("documents/report.txt", Path(tmp) / "report.txt", expected_size=5, max_bytes=cli.MAX_DOWNLOAD_BYTES)),
+            client.method_calls.index(mock.call.get_updates(1, offset=2, timeout=0, allowed_updates=["message"])),
+        )
+        self.assertIn("downloaded files=1", stdout.getvalue())
+
+    def test_inbox_download_files_lists_multiple_attachments(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            first_target = Path(tmp) / "report.txt"
+            second_target = Path(tmp) / "photo-10-id-b34c1e9b3ca5ceb9.jpg"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.return_value = [
+                    self.update(
+                        1,
+                        10,
+                        1_700_000_000,
+                        text="",
+                        origin=None,
+                        media={
+                            "document": {"file_id": "doc-file-id", "file_name": "report.txt", "file_size": 5},
+                            "photo": [{"file_id": "photo-file-id", "width": 100, "height": 100, "file_size": 9}],
+                        },
+                    )
+                ]
+                client.get_file.side_effect = [
+                    {"file_id": "doc-file-id", "file_path": "documents/report.txt", "file_size": 5},
+                    {"file_id": "photo-file-id", "file_path": "photos/photo.jpg", "file_size": 9},
+                ]
+                client.download_file.side_effect = [
+                    {"path": str(first_target), "bytes": 5, "sha256": "first"},
+                    {"path": str(second_target), "bytes": 9, "sha256": "second"},
+                ]
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(client.get_file.call_count, 2)
+        self.assertEqual(client.download_file.call_count, 2)
+        self.assertIn("downloaded files=2", stdout.getvalue())
+        self.assertIn(f"path={first_target} bytes=5 sha256=first", stdout.getvalue())
+        self.assertIn(f"path={second_target} bytes=9 sha256=second", stdout.getvalue())
+
+    def test_inbox_json_download_files_keeps_stdout_parseable(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.return_value = [
+                    self.update(
+                        1,
+                        10,
+                        1_700_000_000,
+                        text="",
+                        origin=None,
+                        media={"document": {"file_id": "doc-file-id", "file_name": "report.txt", "file_size": 5}},
+                    )
+                ]
+                client.get_file.return_value = {
+                    "file_id": "doc-file-id",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.return_value = {
+                    "path": str(target),
+                    "bytes": 5,
+                    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                }
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp, "--format", "json"],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["attachments"][0]["download"]["path"], str(target))
+        self.assertNotIn("downloaded files=", stdout.getvalue())
+
+    def test_inbox_jsonl_download_files_keeps_stdout_parseable(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.return_value = [
+                    self.update(
+                        1,
+                        10,
+                        1_700_000_000,
+                        text="",
+                        origin=None,
+                        media={"document": {"file_id": "doc-file-id", "file_name": "report.txt", "file_size": 5}},
+                    )
+                ]
+                client.get_file.return_value = {
+                    "file_id": "doc-file-id",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.return_value = {
+                    "path": str(target),
+                    "bytes": 5,
+                    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                }
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp, "--format", "jsonl"],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["attachments"][0]["download"]["path"], str(target))
+
+    def test_inbox_download_files_without_attachments_does_not_create_tempdir(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = []
+            with mock.patch("agentgram_tg.cli.tempfile.mkdtemp") as mkdtemp:
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--download-files"],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 0)
+        mkdtemp.assert_not_called()
+        self.assertIn("No inbox messages found.", stdout.getvalue())
+
+    def test_inbox_download_failure_does_not_acknowledge(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_updates.return_value = [
+                    self.update(
+                        1,
+                        10,
+                        1_700_000_000,
+                        text="",
+                        origin=None,
+                        media={"document": {"file_id": "doc-file-id", "file_name": "report.txt", "file_size": 5}},
+                    )
+                ]
+                client.get_file.side_effect = TelegramError("Bad Request: file is too big")
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--include-plain", "--download-files", "--download-dir", tmp, "--ack"],
+                        stdout=io.StringIO(),
+                        stderr=stderr,
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+        self.assertEqual(code, 1)
+        self.assertIn("file is too big", stderr.getvalue())
+        client.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
     def test_inbox_peek_is_default_and_does_not_acknowledge(self) -> None:
         with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
             client_cls.return_value.get_updates.return_value = [
@@ -452,6 +939,241 @@ class InboxTests(unittest.TestCase):
                 )
 
         self.assertEqual(code, 0)
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_inbox_large_limit_requires_ack(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            code = cli.run(
+                ["inbox", "--limit", "500"],
+                stdout=io.StringIO(),
+                stderr=stderr,
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                    "TELEGRAM_CHAT_ID": "99",
+                },
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("requires --ack", stderr.getvalue())
+        client_cls.assert_not_called()
+
+    def test_inbox_large_json_limit_is_rejected(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            code = cli.run(
+                ["inbox", "--limit", "500", "--ack", "--format", "json"],
+                stdout=io.StringIO(),
+                stderr=stderr,
+                environ={
+                    "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                    "TELEGRAM_CHAT_ID": "99",
+                },
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--format json", stderr.getvalue())
+        client_cls.assert_not_called()
+
+    def test_inbox_output_dash_keeps_stdout_behavior(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(1, 10, 1_700_000_000, text="stdout note", origin=self.origin_user("Ada")),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--format", "compact", "--output", "-"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("stdout note", stdout.getvalue())
+        self.assertNotIn("path=", stdout.getvalue())
+
+    def test_inbox_output_directory_writes_private_file_and_receipt(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.get_updates.return_value = [
+                    self.update(1, 10, 1_700_000_000, text="private note", origin=self.origin_user("Ada")),
+                ]
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--format", "compact", "--output", tmp],
+                        stdout=stdout,
+                        stderr=io.StringIO(),
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+            files = list(output_dir.iterdir())
+            self.assertEqual(code, 0)
+            self.assertEqual(len(files), 1)
+            self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
+            self.assertIn("private note", files[0].read_text(encoding="utf-8"))
+            self.assertIn("records=1 updates=1 format=compact", stdout.getvalue())
+            self.assertIn("sha256=", stdout.getvalue())
+            self.assertIn("sed -n '1,120p'", stdout.getvalue())
+            self.assertIn("rm --", stdout.getvalue())
+            self.assertNotIn("private note", stdout.getvalue())
+
+    def test_inbox_output_rejects_existing_file_before_fetch(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "inbox.md"
+            output_path.write_text("existing\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                code = cli.run(
+                    ["inbox", "--output", str(output_path)],
+                    stdout=io.StringIO(),
+                    stderr=stderr,
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to overwrite", stderr.getvalue())
+        client_cls.return_value.get_updates.assert_not_called()
+
+    def test_inbox_ack_reads_multiple_batches(self) -> None:
+        stdout = io.StringIO()
+        first_batch = [
+            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"batch-one-{update_id}", origin=self.origin_user("Ada"))
+            for update_id in range(1, 101)
+        ]
+        second_batch = [
+            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"batch-two-{update_id}", origin=self.origin_user("Grace"))
+            for update_id in range(101, 104)
+        ]
+        fetch_batches = [first_batch, second_batch]
+
+        def get_updates(limit: int = 100, **kwargs: object) -> list[dict[str, object]]:
+            if "offset" in kwargs:
+                return []
+            self.assertLessEqual(limit, cli.TELEGRAM_UPDATE_LIMIT)
+            return fetch_batches.pop(0)
+
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.side_effect = get_updates
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_200):
+                code = cli.run(
+                    ["inbox", "--limit", "103", "--ack"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn("batch-one-1", stdout.getvalue())
+        self.assertIn("batch-two-103", stdout.getvalue())
+        client_cls.return_value.get_updates.assert_has_calls(
+            [
+                mock.call(100, timeout=0, allowed_updates=["message"]),
+                mock.call(1, offset=101, timeout=0, allowed_updates=["message"]),
+                mock.call(3, timeout=0, allowed_updates=["message"]),
+                mock.call(1, offset=104, timeout=0, allowed_updates=["message"]),
+            ]
+        )
+
+    def test_inbox_ack_writes_large_jsonl_file_before_each_ack(self) -> None:
+        stdout = io.StringIO()
+        events: list[str] = []
+        first_batch = [
+            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"jsonl-one-{update_id}", origin=self.origin_user("Ada"))
+            for update_id in range(1, 101)
+        ]
+        second_batch = [
+            self.update(update_id, update_id, 1_700_000_000 + update_id, text=f"jsonl-two-{update_id}", origin=self.origin_user("Grace"))
+            for update_id in range(101, 104)
+        ]
+        fetch_batches = [first_batch, second_batch]
+
+        def get_updates(limit: int = 100, **kwargs: object) -> list[dict[str, object]]:
+            events.append("ack" if "offset" in kwargs else "fetch")
+            if "offset" in kwargs:
+                return []
+            self.assertLessEqual(limit, cli.TELEGRAM_UPDATE_LIMIT)
+            return fetch_batches.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.get_updates.side_effect = get_updates
+                with mock.patch("agentgram_tg.cli.os.fsync", side_effect=lambda fd: events.append("fsync")):
+                    with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_200):
+                        code = cli.run(
+                            ["inbox", "--limit", "103", "--ack", "--format", "jsonl", "--output", tmp],
+                            stdout=stdout,
+                            stderr=io.StringIO(),
+                            environ={
+                                "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                                "TELEGRAM_CHAT_ID": "99",
+                            },
+                        )
+
+            files = list(output_dir.iterdir())
+            self.assertEqual(code, 0)
+            self.assertEqual(events, ["fetch", "fsync", "ack", "fetch", "fsync", "ack"])
+            self.assertEqual(len(files), 1)
+            lines = files[0].read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 103)
+            self.assertEqual(json.loads(lines[0])["content"], "jsonl-one-1")
+            self.assertEqual(json.loads(lines[-1])["content"], "jsonl-two-103")
+            self.assertIn("records=103 updates=103 format=jsonl", stdout.getvalue())
+            self.assertNotIn("jsonl-one-1", stdout.getvalue())
+
+    def test_inbox_ack_stops_without_ack_when_batch_has_no_records(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = [
+                self.update(7, 10, 1_700_000_000, text="plain only", origin=None),
+            ]
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--limit", "200", "--ack"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue().strip(), "No inbox messages found.")
+        client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
+    def test_inbox_ack_json_empty_output_stays_json_for_single_batch(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+            client_cls.return_value.get_updates.return_value = []
+            with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                code = cli.run(
+                    ["inbox", "--ack", "--format", "json"],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={
+                        "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                        "TELEGRAM_CHAT_ID": "99",
+                    },
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), [])
         client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
 
     def test_inbox_ack_consumes_after_successful_output(self) -> None:
@@ -524,6 +1246,7 @@ class InboxTests(unittest.TestCase):
                                 since="24h",
                                 include_plain=False,
                                 output_format="markdown",
+                                output=None,
                                 ack=True,
                             ),
                             stdout=io.StringIO(),
@@ -561,6 +1284,39 @@ class InboxTests(unittest.TestCase):
         self.assertIn("were not rendered", stderr.getvalue())
         client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
 
+    def test_inbox_ack_refusal_with_output_prints_cleanup_receipt(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        updates = [
+            self.update(7, 10, 1_700_000_000, text="plain before", origin=None),
+            self.update(8, 20, 1_700_000_000, text="forwarded after", origin=self.origin_user("Ada")),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.get_updates.return_value = updates
+                with mock.patch("agentgram_tg.cli.time.time", return_value=1_700_000_001):
+                    code = cli.run(
+                        ["inbox", "--ack", "--output", tmp],
+                        stdout=stdout,
+                        stderr=stderr,
+                        environ={
+                            "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "TELEGRAM_CHAT_ID": "99",
+                        },
+                    )
+
+            files = list(output_dir.iterdir())
+            self.assertEqual(code, 2)
+            self.assertEqual(len(files), 1)
+            self.assertIn("forwarded after", files[0].read_text(encoding="utf-8"))
+            self.assertIn("were not rendered", stderr.getvalue())
+            self.assertIn("path=", stdout.getvalue())
+            self.assertIn("delete after import: rm --", stdout.getvalue())
+            self.assertNotIn("forwarded after", stdout.getvalue())
+            client_cls.return_value.get_updates.assert_called_once_with(100, timeout=0, allowed_updates=["message"])
+
     def test_acknowledge_inbox_records_never_uses_negative_offset(self) -> None:
         client = mock.Mock()
 
@@ -576,16 +1332,20 @@ class InboxTests(unittest.TestCase):
         date: int,
         *,
         chat_id: int = 99,
-        text: str,
+        text: str = "",
         origin: dict[str, object] | None,
+        media: dict[str, object] | None = None,
     ) -> dict[str, object]:
         message: dict[str, object] = {
             "message_id": message_id,
             "date": date,
             "chat": {"id": chat_id, "type": "private", "first_name": "User"},
             "from": {"id": 555, "first_name": "Forwarder", "username": "forwarder"},
-            "text": text,
         }
+        if text:
+            message["text"] = text
+        if media:
+            message.update(media)
         if origin is not None:
             message["forward_origin"] = origin
         return {"update_id": update_id, "message": message}
@@ -603,7 +1363,7 @@ class InboxTests(unittest.TestCase):
 class CliRunTests(unittest.TestCase):
     def test_help_lists_public_commands(self) -> None:
         output = cli.build_parser().format_help()
-        for command in ("send", "send-file", "chat-id", "inbox", "doctor", "update"):
+        for command in ("send", "send-file", "chat-id", "inbox", "download-file", "doctor", "update"):
             self.assertIn(command, output)
 
     def test_send_requires_token_without_leaking(self) -> None:
@@ -867,6 +1627,97 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertIn("file does not exist", stderr.getvalue())
+
+    def test_download_file_uses_file_id_and_writes_receipt(self) -> None:
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_file.return_value = {
+                    "file_id": "file-id",
+                    "file_unique_id": "file-u",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.return_value = {
+                    "path": str(target),
+                    "bytes": 5,
+                    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                }
+                code = cli.run(
+                    ["download-file", "file-id", "--output", str(target)],
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                    environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+                )
+
+        self.assertEqual(code, 0)
+        client.get_file.assert_called_once_with("file-id")
+        client.download_file.assert_called_once_with(
+            "documents/report.txt",
+            target,
+            expected_size=5,
+            max_bytes=cli.MAX_DOWNLOAD_BYTES,
+        )
+        self.assertIn(f"path={target}", stdout.getvalue())
+        self.assertIn("sha256=", stdout.getvalue())
+
+    def test_download_file_rejects_missing_file_path(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.get_file.return_value = {"file_id": "file-id", "file_unique_id": "file-u"}
+                code = cli.run(
+                    ["download-file", "file-id", "--output", tmp],
+                    stdout=io.StringIO(),
+                    stderr=stderr,
+                    environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("downloadable file_path", stderr.getvalue())
+
+    def test_download_file_download_error_is_telegram_error(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client = client_cls.return_value
+                client.get_file.return_value = {
+                    "file_id": "file-id",
+                    "file_path": "documents/report.txt",
+                    "file_size": 5,
+                }
+                client.download_file.side_effect = TelegramError("Telegram file download failed: timeout")
+                code = cli.run(
+                    ["download-file", "file-id", "--output", str(target)],
+                    stdout=io.StringIO(),
+                    stderr=stderr,
+                    environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+                )
+
+        self.assertEqual(code, 1)
+        self.assertIn("download failed", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_download_file_filename_requires_safe_file_name(self) -> None:
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("agentgram_tg.cli.TelegramClient") as client_cls:
+                client_cls.return_value.get_file.return_value = {
+                    "file_id": "file-id",
+                    "file_path": "documents/report.txt",
+                }
+                code = cli.run(
+                    ["download-file", "file-id", "--output", tmp, "--filename", "../secret.txt"],
+                    stdout=io.StringIO(),
+                    stderr=stderr,
+                    environ={"TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"},
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("filename", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_send_file_rejects_malformed_token_without_traceback(self) -> None:
@@ -1248,6 +2099,151 @@ class TelegramClientTests(unittest.TestCase):
         with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
             with self.assertRaisesRegex(TelegramError, "getUpdates returned an unexpected result"):
                 TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates()
+
+    def test_get_file_posts_file_id_and_returns_valid_file(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            b'{"ok": true, "result": {"file_id": "file-id", "file_unique_id": "file-u", '
+            b'"file_size": 5, "file_path": "documents/report.txt"}}'
+        )
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+            result = TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_file("file-id")
+
+        self.assertEqual(result["file_path"], "documents/report.txt")
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.full_url, "https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz/getFile")
+        self.assertEqual(json.loads(req.data.decode("utf-8")), {"file_id": "file-id"})
+
+    def test_get_file_rejects_unexpected_result(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": []}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(TelegramError, "getFile returned an unexpected result"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_file("file-id")
+
+    def test_download_file_writes_private_file_and_returns_receipt(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = [b"hello", b""]
+        token = "123456:abcdefghijklmnopqrstuvwxyz"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+                result = TelegramClient(token).download_file(
+                    "documents/report.txt",
+                    target,
+                    expected_size=5,
+                    max_bytes=20,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "hello")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+        self.assertEqual(result["bytes"], 5)
+        self.assertEqual(result["sha256"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_method(), "GET")
+        self.assertEqual(req.full_url, f"https://api.telegram.org/file/bot{token}/documents/report.txt")
+
+    def test_download_file_rejects_oversized_expected_size_before_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "large.bin"
+            with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(TelegramError, "file is too large"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").download_file(
+                        "documents/large.bin",
+                        target,
+                        expected_size=21,
+                        max_bytes=20,
+                    )
+
+        urlopen.assert_not_called()
+        self.assertFalse(target.exists())
+
+    def test_download_file_rejects_max_bytes_above_public_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "large.bin"
+            with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(TelegramError, "cannot exceed"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").download_file(
+                        "documents/large.bin",
+                        target,
+                        max_bytes=cli.MAX_DOWNLOAD_BYTES + 1,
+                    )
+
+        urlopen.assert_not_called()
+        self.assertFalse(target.exists())
+
+    def test_download_file_refuses_existing_destination_before_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            target.write_text("existing\n", encoding="utf-8")
+            with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+                with self.assertRaisesRegex(TelegramError, "refusing to overwrite"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").download_file(
+                        "documents/report.txt",
+                        target,
+                        max_bytes=20,
+                    )
+
+        urlopen.assert_not_called()
+
+    def test_download_file_removes_partial_file_when_size_exceeds_limit(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = [b"0123456789", b"0123456789", b"x", b""]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "large.bin"
+            with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+                with self.assertRaisesRegex(TelegramError, "file is too large"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").download_file(
+                        "documents/large.bin",
+                        target,
+                        max_bytes=20,
+                    )
+            self.assertFalse(target.exists())
+
+    def test_download_file_http_error_redacts_token(self) -> None:
+        token = "123456:abcdefghijklmnopqrstuvwxyz"
+        http_error = error.HTTPError(
+            f"https://api.telegram.org/file/bot{token}/documents/report.txt",
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=io.BytesIO(b'{"ok": false, "description": "token 123456:abcdefghijklmnopqrstuvwxyz invalid"}'),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.telegram.request.urlopen", side_effect=http_error):
+                with self.assertRaises(TelegramError) as caught:
+                    TelegramClient(token).download_file("documents/report.txt", target)
+
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIn("<redacted>", str(caught.exception))
+        self.assertFalse(target.exists())
+
+    def test_download_file_interrupted_read_becomes_telegram_error(self) -> None:
+        import http.client
+
+        class InterruptedResponse:
+            def __enter__(self) -> "InterruptedResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                raise http.client.IncompleteRead(b"abc")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.txt"
+            with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=InterruptedResponse()):
+                with self.assertRaisesRegex(TelegramError, "download failed"):
+                    TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").download_file("documents/report.txt", target)
+            self.assertFalse(target.exists())
 
     def test_encode_multipart_form_includes_fields_and_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
