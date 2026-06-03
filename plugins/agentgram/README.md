@@ -99,6 +99,59 @@ For raw Telegram `getUpdates` output:
 agentgram chat-id --raw
 ```
 
+### Forwarded Inbox
+
+To let an agent read recent context from Telegram without a user-session login,
+manually forward the relevant group, channel, or private-chat messages into the
+Agentgram bot chat, then ask the agent to read them. The agent can run:
+
+```sh
+agentgram inbox
+agentgram inbox --limit 100
+agentgram inbox --since 3h
+agentgram inbox --include-plain
+agentgram inbox --format json
+```
+
+The default inbox mode is equivalent to:
+
+```sh
+agentgram inbox --limit 100 --since 24h --forwarded-only --format markdown --peek
+```
+
+`--forwarded-only` excludes direct notes sent to the bot. Use
+`--include-plain` when the forwarded context is mixed with direct notes to the
+agent. `--format markdown` is intended for human-readable agent context, while
+`--format json` emits stable records for tools.
+
+Inbox reads pending Telegram Bot API updates only. It is not full Telegram chat
+history, does not use MTProto user sessions, does not run a webhook receiver,
+and does not store message text, captions, sender names, raw updates, or
+transcripts in local files. Pending updates can expire, and they can be consumed
+by another process using the same bot token.
+
+`agentgram inbox` defaults to `--peek`, so repeated runs do not consume updates.
+Use `--ack` only after a successful import, or when you explicitly want to
+consume the rendered updates:
+
+```sh
+agentgram inbox --ack
+```
+
+Telegram acknowledges updates by offset, which also consumes all lower pending
+update ids. Agentgram refuses to ack when doing so would skip fetched updates
+that were filtered out and not rendered. Rerun with `--include-plain` or a
+narrower filter if that happens.
+
+Forwarded authorship depends on Telegram's `forward_origin` metadata and the
+sender's privacy settings. Agentgram shows the user who forwarded the message to
+the bot and, when Telegram provides it, the original user, hidden-user name,
+source chat, or source channel. Hidden or uncertain authorship is marked in the
+transcript.
+
+`getUpdates` cannot be used while the same bot has an outgoing webhook set.
+Remove the webhook or use a bot token dedicated to Agentgram inbox reads.
+
 To check whether the local git checkout is current using existing local refs, or
 to update with a fast-forward-only pull:
 
@@ -137,9 +190,11 @@ When a user asks an agent to send a Telegram message, the agent should:
 2. Run `agentgram send "message"` for short text, `agentgram send-file <path>`
    for an explicit local file, or `agentgram send --split/--as-file` for long
    text, if setup is valid.
-3. Confirm ambiguous file paths before sending and never send generated files
+3. Run `agentgram inbox` when the user asks to read recently forwarded Telegram
+   messages.
+4. Confirm ambiguous file paths before sending and never send generated files
    automatically just because a task completed.
-4. Avoid direct Telegram API calls unless the user explicitly asks to bypass the
+5. Avoid direct Telegram API calls unless the user explicitly asks to bypass the
    Agentgram CLI.
 
 ## Troubleshooting
@@ -156,6 +211,13 @@ When a user asks an agent to send a Telegram message, the agent should:
   below Telegram's bot upload limit.
 - Forbidden chat: add the bot to the target chat or start a private chat with
   it, then retry after confirming the chat id.
+- Inbox is empty: forward messages to the bot chat and rerun before Telegram's
+  pending updates expire. Check that another process has not consumed updates
+  from the same bot token.
+- Inbox ack is refused: rerun with `--include-plain` or narrower filters so
+  Agentgram does not skip unrendered pending updates.
+- Webhook conflict: remove the outgoing webhook or use a separate bot token for
+  Agentgram inbox reads.
 - Telegram API errors: Agentgram prints Telegram's error description without the
   bot token. Re-run `agentgram doctor` before retrying.
 
