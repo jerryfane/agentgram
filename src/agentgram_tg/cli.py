@@ -111,7 +111,20 @@ def build_parser() -> argparse.ArgumentParser:
         dest="include_plain",
         help="also include direct non-forwarded messages sent to the bot",
     )
-    inbox.set_defaults(func=cmd_inbox, include_plain=False, output_format="markdown")
+    inbox_ack = inbox.add_mutually_exclusive_group()
+    inbox_ack.add_argument(
+        "--peek",
+        action="store_false",
+        dest="ack",
+        help="read without consuming updates; this is the default",
+    )
+    inbox_ack.add_argument(
+        "--ack",
+        action="store_true",
+        dest="ack",
+        help="consume rendered updates after successful output",
+    )
+    inbox.set_defaults(func=cmd_inbox, include_plain=False, output_format="markdown", ack=False)
     inbox.add_argument("--format", choices=("markdown", "json"), default="markdown", dest="output_format")
 
     doctor = subcommands.add_parser("doctor", help="check Agentgram and Telegram configuration")
@@ -267,7 +280,8 @@ def cmd_inbox(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, st
     chat_id = args.chat_id or require_env(environ, CHAT_ID_ENV)
     limit = validate_inbox_limit(args.limit)
     since_seconds = parse_duration(args.since)
-    updates = TelegramClient(token).get_updates(
+    client = TelegramClient(token)
+    updates = client.get_updates(
         limit,
         timeout=0,
         allowed_updates=["message"],
@@ -280,9 +294,12 @@ def cmd_inbox(args: argparse.Namespace, *, stdout: TextIO, environ: dict[str, st
         now=int(time.time()),
     )
     if args.output_format == "json":
-        print(json.dumps(records, indent=2, sort_keys=True), file=stdout)
+        output = json.dumps(records, indent=2, sort_keys=True)
     else:
-        print(render_inbox_markdown(records), file=stdout)
+        output = render_inbox_markdown(records)
+    print(output, file=stdout)
+    if args.ack:
+        acknowledge_inbox_records(client, updates, records)
     return 0
 
 
@@ -528,6 +545,39 @@ def render_inbox_markdown(records: list[dict[str, Any]]) -> str:
             )
         )
     return "\n\n".join(sections)
+
+
+def acknowledge_inbox_records(
+    client: TelegramClient,
+    updates: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> None:
+    update_ids = [record.get("update_id") for record in records]
+    integer_update_ids = [update_id for update_id in update_ids if isinstance(update_id, int)]
+    if not integer_update_ids:
+        return
+    offset = max(integer_update_ids) + 1
+    if offset < 0:
+        raise CliError("refusing to acknowledge inbox with a negative offset")
+    rendered_update_ids = set(integer_update_ids)
+    hidden_update_ids = [
+        update.get("update_id")
+        for update in updates
+        if isinstance(update.get("update_id"), int)
+        and update["update_id"] < offset
+        and update["update_id"] not in rendered_update_ids
+    ]
+    if hidden_update_ids:
+        raise CliError(
+            "refusing to acknowledge because some fetched updates before the ack offset were not rendered; "
+            "rerun with --include-plain or narrower filters"
+        )
+    client.get_updates(
+        1,
+        offset=offset,
+        timeout=0,
+        allowed_updates=["message"],
+    )
 
 
 def extract_message_content(message: dict[str, Any]) -> str:
