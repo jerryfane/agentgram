@@ -831,6 +831,81 @@ class TelegramClientTests(unittest.TestCase):
             with self.assertRaisesRegex(TelegramError, "getMe returned an unexpected result"):
                 TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_me()
 
+    def test_get_updates_posts_default_payload(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": []}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+            result = TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates()
+
+        self.assertEqual(result, [])
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.full_url, "https://api.telegram.org/bot123456:abcdefghijklmnopqrstuvwxyz/getUpdates")
+        self.assertEqual(json.loads(req.data.decode("utf-8")), {"limit": 20, "timeout": 0})
+
+    def test_get_updates_posts_explicit_payload(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": [{"update_id": 10}]}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+            result = TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates(
+                100,
+                offset=123,
+                timeout=5,
+                allowed_updates=["message"],
+            )
+
+        self.assertEqual(result, [{"update_id": 10}])
+        req = urlopen.call_args.args[0]
+        self.assertEqual(
+            json.loads(req.data.decode("utf-8")),
+            {
+                "allowed_updates": ["message"],
+                "limit": 100,
+                "offset": 123,
+                "timeout": 5,
+            },
+        )
+
+    def test_get_updates_extends_http_timeout_for_long_polling(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": []}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response) as urlopen:
+            TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates(timeout=30)
+
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 35.0)
+
+    def test_get_updates_rejects_invalid_limit_before_request(self) -> None:
+        with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(TelegramError, "limit must be from 1 to 100"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates(0)
+
+        urlopen.assert_not_called()
+
+    def test_get_updates_rejects_invalid_timeout_before_request(self) -> None:
+        with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(TelegramError, "timeout must be a non-negative integer"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates(timeout=-1)
+
+        urlopen.assert_not_called()
+
+    def test_get_updates_rejects_non_string_allowed_update(self) -> None:
+        with mock.patch("agentgram_tg.telegram.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(TelegramError, "allowed_updates must be a list of strings"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates(allowed_updates=["message", 7])
+
+        urlopen.assert_not_called()
+
+    def test_get_updates_rejects_unexpected_result(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": {}}'
+
+        with mock.patch("agentgram_tg.telegram.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(TelegramError, "getUpdates returned an unexpected result"):
+                TelegramClient("123456:abcdefghijklmnopqrstuvwxyz").get_updates()
+
     def test_encode_multipart_form_includes_fields_and_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.txt"
