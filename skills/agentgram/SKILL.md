@@ -26,6 +26,11 @@ agentgram send "message text"
 agentgram send --split "long message text"
 agentgram send --as-file --filename report.md "long message text"
 agentgram send-file ./report.md --caption "Report"
+agentgram inbox
+agentgram inbox --limit 100
+agentgram inbox --since 3h
+agentgram inbox --include-plain
+agentgram inbox --ack
 agentgram chat-id
 agentgram doctor
 agentgram update
@@ -87,6 +92,34 @@ better delivered as a file. Omit `--filename` only when the default
 Do not send automatic status updates merely because an agent task completed.
 Do not send files automatically just because a task generated one. Agentgram
 sends should be explicit and user-requested.
+
+## Inbox Workflow
+
+Use `$AGENTGRAM_CMD inbox` when the user asks to read recent Telegram messages
+they forwarded to the Agentgram bot, such as "read the recent messages I
+forwarded to you" or "import the Telegram context I just forwarded".
+
+Use `$AGENTGRAM_CMD inbox --limit 100` when the user asks for the last 100
+pending forwarded messages. Use `$AGENTGRAM_CMD inbox --since 3h` when the user
+asks for messages from the last 3 hours. Use `$AGENTGRAM_CMD inbox
+--include-plain` when the user says they also sent direct notes to the bot, or
+that the forwarded context is mixed with direct messages.
+
+The default inbox mode is `--peek`, which reads without consuming Telegram
+updates. Use `$AGENTGRAM_CMD inbox --ack` only after a successful import, or
+when the user explicitly asks to consume or clear the forwarded messages.
+
+Inbox uses Telegram Bot API pending updates only. It is not full Telegram chat
+history and does not use an MTProto user session. Pending updates can expire,
+can be consumed by another process using the same bot token, and cannot be read
+with `getUpdates` while an outgoing webhook is active. If Telegram reports a
+webhook conflict, tell the user to remove the webhook or use a separate bot
+token for Agentgram inbox reads.
+
+Agentgram does not write message content, captions, sender names, raw updates,
+or transcripts to local files. Forwarded authorship depends on Telegram
+`forward_origin` metadata and sender privacy settings; hidden or uncertain
+authors are marked in the output.
 
 ## Update Workflow
 
