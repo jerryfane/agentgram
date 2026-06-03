@@ -27,7 +27,13 @@ class TelegramClient:
     api_root: str = API_ROOT
     timeout: float = 15.0
 
-    def request(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+    def request(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         token = self.token.strip()
         if not looks_like_token(token):
             raise TelegramError("Telegram bot token shape is invalid")
@@ -39,7 +45,7 @@ class TelegramClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        return self._perform_request(req, token)
+        return self._perform_request(req, token, timeout=timeout)
 
     def request_multipart(
         self,
@@ -63,9 +69,9 @@ class TelegramClient:
     def method_url(self, token: str, method: str) -> str:
         return f"{self.api_root}/bot{token}/{method}"
 
-    def _perform_request(self, req: request.Request, token: str) -> Any:
+    def _perform_request(self, req: request.Request, token: str, *, timeout: float | None = None) -> Any:
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with request.urlopen(req, timeout=self.timeout if timeout is None else timeout) as response:
                 raw = response.read().decode("utf-8")
         except error.HTTPError as exc:
             raw_error = exc.read().decode("utf-8", errors="replace")
@@ -91,8 +97,21 @@ class TelegramClient:
             raise TelegramError("Telegram getMe returned an unexpected result")
         return result
 
-    def get_updates(self, limit: int = 20) -> list[dict[str, Any]]:
-        result = self.request("getUpdates", {"limit": limit, "timeout": 0})
+    def get_updates(
+        self,
+        limit: int = 20,
+        *,
+        offset: int | None = None,
+        timeout: int = 0,
+        allowed_updates: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        update_timeout = validate_update_timeout(timeout)
+        payload: dict[str, Any] = {"limit": validate_update_limit(limit), "timeout": update_timeout}
+        if offset is not None:
+            payload["offset"] = offset
+        if allowed_updates is not None:
+            payload["allowed_updates"] = validate_allowed_updates(allowed_updates)
+        result = self.request("getUpdates", payload, timeout=max(self.timeout, float(update_timeout) + 5.0))
         if not isinstance(result, list):
             raise TelegramError("Telegram getUpdates returned an unexpected result")
         return result
@@ -197,6 +216,31 @@ def escape_multipart_filename(filename: str) -> str:
 
 def looks_like_token(value: str) -> bool:
     return bool(TOKEN_RE.match(value.strip()))
+
+
+def validate_update_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TelegramError("Telegram getUpdates limit must be an integer from 1 to 100")
+    if limit < 1 or limit > 100:
+        raise TelegramError("Telegram getUpdates limit must be from 1 to 100")
+    return limit
+
+
+def validate_update_timeout(timeout: int) -> int:
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise TelegramError("Telegram getUpdates timeout must be a non-negative integer")
+    if timeout < 0:
+        raise TelegramError("Telegram getUpdates timeout must be a non-negative integer")
+    return timeout
+
+
+def validate_allowed_updates(allowed_updates: list[str]) -> list[str]:
+    if not isinstance(allowed_updates, list):
+        raise TelegramError("Telegram allowed_updates must be a list of strings")
+    for update_type in allowed_updates:
+        if not isinstance(update_type, str):
+            raise TelegramError("Telegram allowed_updates must be a list of strings")
+    return allowed_updates
 
 
 def redact_token(message: str, token: str | None) -> str:
